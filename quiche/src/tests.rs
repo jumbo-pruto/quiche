@@ -12938,3 +12938,236 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+/// A single accepted CE-marked packet is reported once in the peer's next
+/// ACK frame.
+#[rstest]
+fn ecn_ack_reports_ce_count(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let pkt_type = Type::Short;
+    let frames = [frame::Frame::Ping { mtu_probe: None }];
+
+    let len = pipe
+        .send_pkt_to_server_with_ecn(
+            pkt_type,
+            &frames,
+            &mut buf,
+            Some(EcnCodepoint::Ce),
+        )
+        .unwrap();
+
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+
+    let ecn_counts = frames.iter().find_map(|f| match f {
+        frame::Frame::ACK { ecn_counts, .. } => Some(ecn_counts.clone()),
+        _ => None,
+    });
+
+    assert_eq!(
+        ecn_counts,
+        Some(Some(frame::EcnCounts::new(0, 0, 1))),
+        "expected exactly one reported CE mark"
+    );
+}
+
+/// Delivering the same CE-marked packet twice (a network-level duplicate)
+/// must not be counted twice.
+#[rstest]
+fn ecn_duplicate_packet_not_double_counted(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let frames = [frame::Frame::Ping { mtu_probe: None }];
+    let written =
+        test_utils::encode_pkt(&mut pipe.client, Type::Short, &frames, &mut buf)
+            .unwrap();
+
+    // Two independent copies of the exact same encrypted datagram, as a
+    // network duplicate would arrive.
+    let mut first_copy = buf;
+    let mut second_copy = buf;
+
+    let server_path = pipe.server.paths.get_active().unwrap();
+    let info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+
+    assert_eq!(
+        pipe.server.recv_with_ecn(
+            &mut first_copy[..written],
+            info,
+            Some(EcnCodepoint::Ce)
+        ),
+        Ok(written)
+    );
+    assert_eq!(
+        pipe.server.recv_with_ecn(
+            &mut second_copy[..written],
+            info,
+            Some(EcnCodepoint::Ce)
+        ),
+        Ok(written)
+    );
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+
+    let ecn_counts = frames.iter().find_map(|f| match f {
+        frame::Frame::ACK { ecn_counts, .. } => Some(ecn_counts.clone()),
+        _ => None,
+    });
+
+    assert_eq!(
+        ecn_counts,
+        Some(Some(frame::EcnCounts::new(0, 0, 1))),
+        "duplicate delivery must not increase the CE count"
+    );
+}
+
+/// When the application never provides ECN metadata (the behavior of the
+/// plain `recv()` method), no ECN counts are ever reported, preserving the
+/// existing default behavior.
+#[rstest]
+fn ecn_not_reported_without_metadata(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut buf = [0; 65535];
+
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    let pkt_type = Type::Short;
+    let frames = [frame::Frame::Ping { mtu_probe: None }];
+
+    let len = pipe
+        .send_pkt_to_server(pkt_type, &frames, &mut buf)
+        .unwrap();
+
+    let frames =
+        test_utils::decode_pkt(&mut pipe.client, &mut buf[..len]).unwrap();
+
+    let ecn_counts = frames.iter().find_map(|f| match f {
+        frame::Frame::ACK { ecn_counts, .. } => Some(ecn_counts.clone()),
+        _ => None,
+    });
+
+    assert_eq!(
+        ecn_counts,
+        Some(None),
+        "no ECN counts should be reported without accessible metadata"
+    );
+}
+
+/// End-to-end sender-side ECN validation: a client with ECN enabled marks
+/// its outgoing packets ECT(0); once the peer's ACK reflects those packets
+/// as received with a nonzero ECN codepoint, the client's ECN sender
+/// transitions to `Capable`.
+#[test]
+fn ecn_sender_validates_on_capable_path() {
+    let mut buf = [0; 65535];
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.enable_ecn(true);
+
+    let mut pipe =
+        test_utils::Pipe::with_client_config(&mut client_config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // A normal handshake round trip doesn't propagate IP-level ECN metadata
+    // through the test harness's plain `recv()` helpers, so install a fresh
+    // ECN sender to exercise steady-state validation in isolation.
+    pipe.client.ecn_sender = Some(ecn::EcnSender::new());
+
+    // Queue an ack-eliciting write, so the server is guaranteed to send an
+    // ACK back for the packet below.
+    assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+
+    let (len, _, ecn) = pipe.client.send_with_ecn(&mut buf).unwrap();
+    assert_eq!(ecn, EcnCodepoint::Ect0);
+
+    // Deliver the packet to the server as if the network had preserved the
+    // ECT(0) marking, then let the server's ACK make its way back.
+    let server_path = pipe.server.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+    pipe.server
+        .recv_with_ecn(&mut buf[..len], recv_info, Some(EcnCodepoint::Ect0))
+        .unwrap();
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+
+    let client_path = pipe.client.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: client_path.local_addr(),
+        from: client_path.peer_addr(),
+    };
+    pipe.client.recv(&mut buf[..len], recv_info).unwrap();
+
+    assert!(pipe.client.ecn_sender.as_ref().unwrap().is_capable());
+}
+
+/// If the network strips the ECN marking from a client's outgoing packets
+/// (bleaching), the client's ECN sender must permanently stop marking.
+#[test]
+fn ecn_sender_fails_on_bleached_path() {
+    let mut buf = [0; 65535];
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.enable_ecn(true);
+
+    let mut pipe =
+        test_utils::Pipe::with_client_config(&mut client_config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // See `ecn_sender_validates_on_capable_path` for why a fresh sender is
+    // installed post-handshake.
+    pipe.client.ecn_sender = Some(ecn::EcnSender::new());
+
+    // Queue an ack-eliciting write, so the server is guaranteed to send an
+    // ACK back for the packet below.
+    assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+
+    let (len, _, ecn) = pipe.client.send_with_ecn(&mut buf).unwrap();
+    assert_eq!(ecn, EcnCodepoint::Ect0);
+
+    // The network strips the marking: the server observes Not-ECT.
+    let server_path = pipe.server.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+    pipe.server
+        .recv_with_ecn(&mut buf[..len], recv_info, Some(EcnCodepoint::NotEct))
+        .unwrap();
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+
+    let client_path = pipe.client.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: client_path.local_addr(),
+        from: client_path.peer_addr(),
+    };
+    pipe.client.recv(&mut buf[..len], recv_info).unwrap();
+
+    assert!(pipe.client.ecn_sender.as_ref().unwrap().is_failed());
+
+    // Marking permanently stops.
+    assert_eq!(pipe.client.stream_send(8, b"world", true), Ok(5));
+    let (_, _, ecn) = pipe.client.send_with_ecn(&mut buf).unwrap();
+    assert_eq!(ecn, EcnCodepoint::NotEct);
+}
