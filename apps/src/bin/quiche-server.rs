@@ -73,6 +73,8 @@ fn main() {
     let mut socket =
         mio::net::UdpSocket::bind(args.listen.parse().unwrap()).unwrap();
 
+    enable_ecn_reporting(&socket);
+
     // Set SO_TXTIME socket option on the listening UDP socket for pacing
     // outgoing packets.
     if !args.disable_pacing {
@@ -156,6 +158,10 @@ fn main() {
         .set_cc_algorithm_name(&conn_args.cc_algorithm)
         .unwrap();
 
+    if conn_args.enable_ecn {
+        config.enable_ecn(true);
+    }
+
     if conn_args.disable_hystart {
         config.enable_hystart(false);
     }
@@ -212,7 +218,7 @@ fn main() {
                 break 'read;
             }
 
-            let (len, from) = match socket.recv_from(&mut buf) {
+            let (len, from, ecn) = match recv_from_with_ecn(&socket, &mut buf) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -425,7 +431,7 @@ fn main() {
             };
 
             // Process potentially coalesced packets.
-            let read = match client.conn.recv(pkt_buf, recv_info) {
+            let read = match client.conn.recv_with_ecn(pkt_buf, recv_info, ecn) {
                 Ok(v) => v,
 
                 Err(e) => {
@@ -556,12 +562,18 @@ fn main() {
                     client.max_datagram_size *
                     client.max_datagram_size;
             let mut total_write = 0;
+            // Start of the current GSO batch: a single sendmsg() call can
+            // only carry one ECN codepoint, so the batch is flushed early
+            // whenever the decided codepoint changes mid-burst.
+            let mut batch_start = 0;
             let mut dst_info = None;
+            let mut batch_ecn = quiche::EcnCodepoint::NotEct;
+            let mut send_failed = false;
 
             while total_write < max_send_burst {
-                let (write, send_info) = match client
+                let (write, send_info, ecn) = match client
                     .conn
-                    .send(&mut out[total_write..max_send_burst])
+                    .send_with_ecn(&mut out[total_write..max_send_burst])
                 {
                     Ok(v) => v,
 
@@ -578,9 +590,34 @@ fn main() {
                     },
                 };
 
+                if total_write > batch_start && ecn != batch_ecn {
+                    if let Err(e) = send_to_with_ecn(
+                        &socket,
+                        &out[batch_start..total_write],
+                        &dst_info.unwrap(),
+                        client.max_datagram_size,
+                        pacing,
+                        enable_gso,
+                        batch_ecn,
+                    ) {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            trace!("send() would block");
+                            send_failed = true;
+                            break;
+                        }
+
+                        panic!("send_to() failed: {e:?}");
+                    }
+
+                    batch_start = total_write;
+                    dst_info = None;
+                }
+
+                batch_ecn = ecn;
                 total_write += write;
 
-                // Use the first packet time to send, not the last.
+                // Use the first packet time of this batch to send, not the
+                // last.
                 let _ = dst_info.get_or_insert(send_info);
 
                 if write < client.max_datagram_size {
@@ -589,17 +626,22 @@ fn main() {
                 }
             }
 
-            if total_write == 0 || dst_info.is_none() {
+            if send_failed {
+                break;
+            }
+
+            if total_write == batch_start || dst_info.is_none() {
                 continue;
             }
 
-            if let Err(e) = send_to(
+            if let Err(e) = send_to_with_ecn(
                 &socket,
-                &out[..total_write],
+                &out[batch_start..total_write],
                 &dst_info.unwrap(),
                 client.max_datagram_size,
                 pacing,
                 enable_gso,
+                batch_ecn,
             ) {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     trace!("send() would block");

@@ -26,6 +26,9 @@
 
 use crate::args::*;
 use crate::common::*;
+use crate::sendto::enable_ecn_reporting;
+use crate::sendto::recv_from_with_ecn;
+use crate::sendto::send_to_with_ecn;
 
 use std::io::prelude::*;
 
@@ -84,12 +87,16 @@ pub fn connect(
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
         .unwrap();
 
+    enable_ecn_reporting(&socket);
+
     let migrate_socket = if args.perform_migration {
         let mut socket =
             mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
         poll.registry()
             .register(&mut socket, mio::Token(1), mio::Interest::READABLE)
             .unwrap();
+
+        enable_ecn_reporting(&socket);
 
         Some(socket)
     } else {
@@ -155,6 +162,10 @@ pub fn connect(
     config
         .set_cc_algorithm_name(&conn_args.cc_algorithm)
         .unwrap();
+
+    if conn_args.enable_ecn {
+        config.enable_ecn(true);
+    }
 
     if conn_args.disable_hystart {
         config.enable_hystart(false);
@@ -229,9 +240,18 @@ pub fn connect(
         scid,
     );
 
-    let (write, send_info) = conn.send(&mut out).expect("initial send failed");
+    let (write, send_info, ecn) =
+        conn.send_with_ecn(&mut out).expect("initial send failed");
 
-    while let Err(e) = socket.send_to(&out[..write], send_info.to) {
+    while let Err(e) = send_to_with_ecn(
+        &socket,
+        &out[..write],
+        &send_info,
+        write,
+        false,
+        false,
+        ecn,
+    ) {
         if e.kind() == std::io::ErrorKind::WouldBlock {
             trace!(
                 "{} -> {}: send() would block",
@@ -281,7 +301,8 @@ pub fn connect(
 
             let local_addr = socket.local_addr().unwrap();
             'read: loop {
-                let (len, from) = match socket.recv_from(&mut buf) {
+                let (len, from, ecn) = match recv_from_with_ecn(socket, &mut buf)
+                {
                     Ok(v) => v,
 
                     Err(e) => {
@@ -317,14 +338,15 @@ pub fn connect(
                 };
 
                 // Process potentially coalesced packets.
-                let read = match conn.recv(&mut buf[..len], recv_info) {
-                    Ok(v) => v,
+                let read =
+                    match conn.recv_with_ecn(&mut buf[..len], recv_info, ecn) {
+                        Ok(v) => v,
 
-                    Err(e) => {
-                        error!("{local_addr}: recv failed: {e:?}");
-                        continue 'read;
-                    },
-                };
+                        Err(e) => {
+                            error!("{local_addr}: recv failed: {e:?}");
+                            continue 'read;
+                        },
+                    };
 
                 trace!("{local_addr}: processed {read} bytes");
             }
@@ -500,11 +522,12 @@ pub fn connect(
 
             for peer_addr in conn.paths_iter(local_addr) {
                 loop {
-                    let (write, send_info) = match conn.send_on_path(
-                        &mut out,
-                        Some(local_addr),
-                        Some(peer_addr),
-                    ) {
+                    let (write, send_info, ecn) = match conn
+                        .send_on_path_with_ecn(
+                            &mut out,
+                            Some(local_addr),
+                            Some(peer_addr),
+                        ) {
                         Ok(v) => v,
 
                         Err(quiche::Error::Done) => {
@@ -522,7 +545,15 @@ pub fn connect(
                         },
                     };
 
-                    if let Err(e) = socket.send_to(&out[..write], send_info.to) {
+                    if let Err(e) = send_to_with_ecn(
+                        socket,
+                        &out[..write],
+                        &send_info,
+                        write,
+                        false,
+                        false,
+                        ecn,
+                    ) {
                         if e.kind() == std::io::ErrorKind::WouldBlock {
                             trace!(
                                 "{} -> {}: send() would block",
