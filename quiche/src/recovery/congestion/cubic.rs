@@ -580,6 +580,97 @@ mod tests {
     }
 
     #[test]
+    fn abe_off_ce_event_uses_ordinary_beta() {
+        let mut sender = test_sender();
+        let size = sender.max_datagram_size;
+
+        sender.abe_mode = AbeMode::Off;
+        sender.send_packet(size);
+
+        let cwnd_prev = sender.congestion_window;
+        sender.ce_event(size, None);
+
+        assert_eq!(
+            sender.congestion_window,
+            (cwnd_prev as f64 * BETA_CUBIC) as usize
+        );
+    }
+
+    #[test]
+    fn abe_congestion_avoidance_only_uses_abe_beta_in_ca() {
+        let mut sender = test_sender();
+        let size = sender.max_datagram_size;
+
+        sender.abe_mode = AbeMode::CongestionAvoidanceOnly;
+
+        // Force the connection into congestion avoidance first, using a
+        // loss event (still an ordinary 0.7 reduction). Keep one packet in
+        // flight throughout so the idle-restart epoch shift never kicks in
+        // and shifts `congestion_recovery_start_time` on us.
+        sender.send_packet(size);
+        sender.send_packet(size);
+        sender.lose_n_packets(1, size, None);
+        assert_eq!(sender.congestion_window, sender.ssthresh.get());
+
+        // Move past the loss recovery episode before probing the CE beta.
+        sender.advance_time(Duration::from_millis(100));
+        sender.send_packet(size);
+
+        // Ack the packet that was in flight before the loss event, clearing
+        // it out of the way without changing cwnd (it's still considered
+        // part of the loss recovery episode).
+        sender.ack_n_packets(1, size);
+
+        let cwnd_prev = sender.congestion_window;
+        sender.ce_event(size, None);
+
+        assert_eq!(
+            sender.congestion_window,
+            (cwnd_prev as f64 * BETA_ABE) as usize
+        );
+    }
+
+    #[test]
+    fn abe_congestion_avoidance_only_uses_ordinary_beta_in_slow_start() {
+        let mut sender = test_sender();
+        let size = sender.max_datagram_size;
+
+        sender.abe_mode = AbeMode::CongestionAvoidanceOnly;
+        sender.send_packet(size);
+
+        // Still in slow start (cwnd < ssthresh, the default ssthresh is
+        // usize::MAX).
+        assert!(sender.congestion_window < sender.ssthresh.get());
+
+        let cwnd_prev = sender.congestion_window;
+        sender.ce_event(size, None);
+
+        assert_eq!(
+            sender.congestion_window,
+            (cwnd_prev as f64 * BETA_CUBIC) as usize
+        );
+    }
+
+    #[test]
+    fn abe_including_slow_start_uses_abe_beta_in_slow_start() {
+        let mut sender = test_sender();
+        let size = sender.max_datagram_size;
+
+        sender.abe_mode = AbeMode::IncludingSlowStart;
+        sender.send_packet(size);
+
+        assert!(sender.congestion_window < sender.ssthresh.get());
+
+        let cwnd_prev = sender.congestion_window;
+        sender.ce_event(size, None);
+
+        assert_eq!(
+            sender.congestion_window,
+            (cwnd_prev as f64 * BETA_ABE) as usize
+        );
+    }
+
+    #[test]
     fn ecn_event_is_not_undone_by_spurious_loss_rollback_heuristic() {
         let mut sender = test_sender();
         let size = sender.max_datagram_size;

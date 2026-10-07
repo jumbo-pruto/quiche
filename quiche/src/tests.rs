@@ -13171,3 +13171,98 @@ fn ecn_sender_fails_on_bleached_path() {
     let (_, _, ecn) = pipe.client.send_with_ecn(&mut buf).unwrap();
     assert_eq!(ecn, EcnCodepoint::NotEct);
 }
+
+/// End-to-end validated CE response: a validated CE mark reduces cwnd by
+/// the RFC 8511 ABE factor (0.85) when `AbeMode::IncludingSlowStart` is
+/// configured, rather than the ordinary CUBIC loss factor (0.7).
+#[test]
+fn ecn_ce_event_reduces_cwnd_with_abe_beta() {
+    let mut buf = [0; 65535];
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.enable_ecn(true);
+    client_config.set_abe_mode(AbeMode::IncludingSlowStart);
+
+    let mut pipe =
+        test_utils::Pipe::with_client_config(&mut client_config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    // See `ecn_sender_validates_on_capable_path` for why a fresh sender is
+    // installed post-handshake.
+    pipe.client.ecn_sender = Some(ecn::EcnSender::new());
+
+    assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+    let (len, _, ecn) = pipe.client.send_with_ecn(&mut buf).unwrap();
+    assert_eq!(ecn, EcnCodepoint::Ect0);
+
+    let cwnd_before = pipe.client.paths.get_active().unwrap().recovery.cwnd();
+
+    // The network marks this packet CE (congestion experienced) rather
+    // than just preserving ECT(0).
+    let server_path = pipe.server.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+    pipe.server
+        .recv_with_ecn(&mut buf[..len], recv_info, Some(EcnCodepoint::Ce))
+        .unwrap();
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+
+    let client_path = pipe.client.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: client_path.local_addr(),
+        from: client_path.peer_addr(),
+    };
+    pipe.client.recv(&mut buf[..len], recv_info).unwrap();
+
+    assert!(pipe.client.ecn_sender.as_ref().unwrap().is_capable());
+
+    let cwnd_after = pipe.client.paths.get_active().unwrap().recovery.cwnd();
+    assert_eq!(cwnd_after, (cwnd_before as f64 * 0.85) as usize);
+}
+
+/// Same scenario as `ecn_ce_event_reduces_cwnd_with_abe_beta`, but with ABE
+/// left at its default `Off`, a validated CE mark must use the ordinary
+/// CUBIC loss factor (0.7), not the ABE factor.
+#[test]
+fn ecn_ce_event_uses_ordinary_beta_when_abe_off() {
+    let mut buf = [0; 65535];
+
+    let mut client_config = test_utils::Pipe::default_config("cubic").unwrap();
+    client_config.enable_ecn(true);
+
+    let mut pipe =
+        test_utils::Pipe::with_client_config(&mut client_config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+
+    pipe.client.ecn_sender = Some(ecn::EcnSender::new());
+
+    assert_eq!(pipe.client.stream_send(4, b"hello", true), Ok(5));
+    let (len, _, ecn) = pipe.client.send_with_ecn(&mut buf).unwrap();
+    assert_eq!(ecn, EcnCodepoint::Ect0);
+
+    let cwnd_before = pipe.client.paths.get_active().unwrap().recovery.cwnd();
+
+    let server_path = pipe.server.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: server_path.local_addr(),
+        from: server_path.peer_addr(),
+    };
+    pipe.server
+        .recv_with_ecn(&mut buf[..len], recv_info, Some(EcnCodepoint::Ce))
+        .unwrap();
+
+    let (len, _) = pipe.server.send(&mut buf).unwrap();
+
+    let client_path = pipe.client.paths.get_active().unwrap();
+    let recv_info = RecvInfo {
+        to: client_path.local_addr(),
+        from: client_path.peer_addr(),
+    };
+    pipe.client.recv(&mut buf[..len], recv_info).unwrap();
+
+    let cwnd_after = pipe.client.paths.get_active().unwrap().recovery.cwnd();
+    assert_eq!(cwnd_after, (cwnd_before as f64 * 0.7) as usize);
+}
