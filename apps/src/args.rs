@@ -57,6 +57,7 @@ pub struct CommonArgs {
     pub initial_rtt: Duration,
     pub initial_cwnd_packets: u64,
     pub enable_ecn: bool,
+    pub abe_mode: String,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -200,6 +201,11 @@ impl Args for CommonArgs {
             .unwrap();
 
         let enable_ecn = args.get_bool("--ecn");
+        let abe_mode = args.get_str("--abe").to_string();
+
+        if abe_mode != "off" && (!enable_ecn || cc_algorithm != "cubic") {
+            panic!("--abe {abe_mode} requires --ecn and --cc-algorithm cubic");
+        }
 
         CommonArgs {
             alpns,
@@ -226,6 +232,7 @@ impl Args for CommonArgs {
             initial_rtt,
             initial_cwnd_packets,
             enable_ecn,
+            abe_mode,
         }
     }
 }
@@ -257,6 +264,7 @@ impl Default for CommonArgs {
             initial_rtt: Duration::from_millis(333),
             initial_cwnd_packets: 10,
             enable_ecn: false,
+            abe_mode: "off".to_string(),
         }
     }
 }
@@ -305,6 +313,7 @@ Options:
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
   --ecn                    Attempt ECN(0) marking and validation (CUBIC only).
+  --abe MODE               RFC 8511 Alternate Backoff with ECN mode: off, ca-only, all-phases. Requires --ecn and --cc-algorithm cubic [default: off].
   -h --help                Show this screen.
 ";
 
@@ -482,6 +491,7 @@ Options:
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
   --ecn                        Attempt ECN(0) marking and validation (CUBIC only).
+  --abe MODE                   RFC 8511 Alternate Backoff with ECN mode: off, ca-only, all-phases. Requires --ecn and --cc-algorithm cubic [default: off].
   -h --help                   Show this screen.
 ";
 

@@ -162,6 +162,14 @@ fn main() {
         config.enable_ecn(true);
     }
 
+    match conn_args.abe_mode.as_str() {
+        "off" => (),
+        "ca-only" =>
+            config.set_abe_mode(quiche::AbeMode::CongestionAvoidanceOnly),
+        "all-phases" => config.set_abe_mode(quiche::AbeMode::IncludingSlowStart),
+        other => panic!("invalid --abe mode: {other}"),
+    }
+
     if conn_args.disable_hystart {
         config.enable_hystart(false);
     }

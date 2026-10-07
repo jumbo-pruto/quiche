@@ -44,6 +44,7 @@ use super::Congestion;
 use super::CongestionControlOps;
 use super::CongestionEventCause;
 use crate::recovery::MINIMUM_WINDOW_PACKETS;
+use crate::AbeMode;
 
 pub(crate) static CUBIC: CongestionControlOps = CongestionControlOps {
     on_init,
@@ -61,6 +62,10 @@ pub(crate) static CUBIC: CongestionControlOps = CongestionControlOps {
 ///
 /// These are recommended value in RFC8312.
 const BETA_CUBIC: f64 = 0.7;
+
+/// RFC 8511 Alternate Backoff with ECN (ABE) reduction factor, used instead
+/// of `BETA_CUBIC` for a validated CE mark when `AbeMode` allows it.
+const BETA_ABE: f64 = 0.85;
 
 const C: f64 = 0.4;
 
@@ -367,6 +372,33 @@ fn on_packet_acked(
     }
 }
 
+// Selects the reduction factor for a congestion event, per RFC 8511 Section
+// 4.2. Loss always uses the ordinary CUBIC factor. A validated ECN CE mark
+// uses the ABE factor only when `AbeMode` allows it for the phase the
+// connection was in immediately before this event.
+fn beta_for_event(r: &Congestion, cause: CongestionEventCause) -> f64 {
+    match cause {
+        CongestionEventCause::Loss => BETA_CUBIC,
+
+        CongestionEventCause::Ecn => match r.abe_mode {
+            AbeMode::Off => BETA_CUBIC,
+
+            AbeMode::CongestionAvoidanceOnly => {
+                let in_congestion_avoidance =
+                    r.congestion_window >= r.ssthresh.get();
+
+                if in_congestion_avoidance && !r.hystart.in_css() {
+                    BETA_ABE
+                } else {
+                    BETA_CUBIC
+                }
+            },
+
+            AbeMode::IncludingSlowStart => BETA_ABE,
+        },
+    }
+}
+
 fn congestion_event(
     r: &mut Congestion, bytes_in_flight: usize, _lost_bytes: usize,
     time_sent: Instant, cause: CongestionEventCause, now: Instant,
@@ -376,10 +408,16 @@ fn congestion_event(
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.
     if !in_congestion_recovery {
+        // The phase check inside `beta_for_event` must see the state from
+        // before this reduction is applied below.
+        let beta = beta_for_event(r, cause);
+
         r.congestion_recovery_start_time = Some(now);
         r.cubic_state.last_event_cause = Some(cause);
 
-        // Fast convergence.
+        // Fast convergence: this heuristic is orthogonal to which factor
+        // triggered the reduction, so it always keeps using the ordinary
+        // CUBIC factor, not `beta`.
         if (r.congestion_window as f64) < r.cubic_state.w_max {
             r.cubic_state.w_max =
                 r.congestion_window as f64 * (1.0 + BETA_CUBIC) / 2.0;
@@ -387,7 +425,7 @@ fn congestion_event(
             r.cubic_state.w_max = r.congestion_window as f64;
         }
 
-        let ssthresh = (r.congestion_window as f64 * BETA_CUBIC) as usize;
+        let ssthresh = (r.congestion_window as f64 * beta) as usize;
         let ssthresh =
             cmp::max(ssthresh, r.max_datagram_size * MINIMUM_WINDOW_PACKETS);
         r.ssthresh.update(ssthresh, r.hystart.in_css());
@@ -400,8 +438,7 @@ fn congestion_event(
                 .cubic_k(r.congestion_window, r.max_datagram_size)
         };
 
-        r.cubic_state.cwnd_inc =
-            (r.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as usize;
+        r.cubic_state.cwnd_inc = (r.cubic_state.cwnd_inc as f64 * beta) as usize;
 
         r.cubic_state.w_est = r.congestion_window as f64;
         r.cubic_state.alpha_aimd = ALPHA_AIMD;

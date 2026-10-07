@@ -33,6 +33,7 @@ use super::Sent;
 use crate::recovery::rtt;
 use crate::recovery::rtt::RttStats;
 use crate::recovery::CongestionControlAlgorithm;
+use crate::AbeMode;
 use crate::StartupExit;
 use crate::StartupExitReason;
 
@@ -130,6 +131,8 @@ pub struct Congestion {
     pub(crate) lost_count: usize,
 
     pub(crate) enable_cubic_idle_restart_fix: bool,
+
+    pub(crate) abe_mode: AbeMode,
 }
 
 impl Congestion {
@@ -171,6 +174,8 @@ impl Congestion {
 
             enable_cubic_idle_restart_fix: recovery_config
                 .enable_cubic_idle_restart_fix,
+
+            abe_mode: recovery_config.abe_mode,
         };
 
         (cc.cc_ops.on_init)(&mut cc);

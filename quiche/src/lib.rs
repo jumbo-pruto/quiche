@@ -522,6 +522,32 @@ pub enum EcnCodepoint {
     Ce     = 3,
 }
 
+/// Alternate Backoff with ECN (ABE, RFC 8511) mode for the CUBIC congestion
+/// controller.
+///
+/// This only takes effect while ECN validation is both enabled
+/// ([`Config::enable_ecn()`]) and successful, and the congestion controller
+/// is CUBIC; it is silently ignored otherwise. Loss-triggered congestion
+/// events always use the ordinary 0.7 reduction, in every mode.
+///
+/// [`Config::enable_ecn()`]: struct.Config.html#method.enable_ecn
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AbeMode {
+    /// Do not apply ABE: a validated CE mark reduces cwnd/ssthresh by the
+    /// ordinary CUBIC factor of 0.7, same as a loss event.
+    #[default]
+    Off,
+
+    /// Apply the ABE factor of 0.85 to a validated CE mark only while in
+    /// congestion avoidance (i.e. not in slow start or HyStart++
+    /// conservative slow start); slow start/CSS still use 0.7.
+    CongestionAvoidanceOnly,
+
+    /// Apply the ABE factor of 0.85 to a validated CE mark in every phase,
+    /// including slow start and HyStart++ conservative slow start.
+    IncludingSlowStart,
+}
+
 /// Ancillary information about incoming packets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecvInfo {
@@ -611,6 +637,9 @@ pub struct Config {
     /// congestion controller's original path.
     enable_ecn: bool,
 
+    /// RFC 8511 Alternate Backoff with ECN mode.
+    abe_mode: AbeMode,
+
     tx_cap_factor: f64,
 
     dgram_recv_max_queue_len: usize,
@@ -690,6 +719,8 @@ impl Config {
             max_pacing_rate: None,
 
             enable_ecn: false,
+
+            abe_mode: AbeMode::Off,
 
             tx_cap_factor: TX_CAP_FACTOR,
 
@@ -1215,6 +1246,19 @@ impl Config {
     /// [`send_on_path()`]: struct.Connection.html#method.send_on_path
     pub fn enable_ecn(&mut self, v: bool) {
         self.enable_ecn = v;
+    }
+
+    /// Configures the RFC 8511 Alternate Backoff with ECN (ABE) mode.
+    ///
+    /// See [`AbeMode`] for the available modes and their effect. This only
+    /// takes effect together with [`enable_ecn()`] and the CUBIC congestion
+    /// controller.
+    ///
+    /// The default value is [`AbeMode::Off`].
+    ///
+    /// [`enable_ecn()`]: Config::enable_ecn
+    pub fn set_abe_mode(&mut self, mode: AbeMode) {
+        self.abe_mode = mode;
     }
 
     /// Configures whether to enable receiving DATAGRAM frames.

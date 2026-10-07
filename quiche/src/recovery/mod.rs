@@ -142,6 +142,7 @@ pub struct RecoveryConfig {
     pub initial_congestion_window_packets: usize,
     pub enable_relaxed_loss_threshold: bool,
     pub enable_cubic_idle_restart_fix: bool,
+    pub abe_mode: crate::AbeMode,
 }
 
 impl RecoveryConfig {
@@ -159,6 +160,7 @@ impl RecoveryConfig {
                 .initial_congestion_window_packets,
             enable_relaxed_loss_threshold: config.enable_relaxed_loss_threshold,
             enable_cubic_idle_restart_fix: config.enable_cubic_idle_restart_fix,
+            abe_mode: config.abe_mode,
         }
     }
 }
