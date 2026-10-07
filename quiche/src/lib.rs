@@ -501,6 +501,27 @@ const MAX_CRYPTO_STREAM_OFFSET: u64 = 1 << 16;
 // The send capacity factor.
 const TX_CAP_FACTOR: f64 = 1.0;
 
+/// A codepoint of the ECN field in the IP header of a received or sent
+/// packet, as defined in RFC 3168.
+///
+/// The numeric values match the two-bit IP ECN field, so applications can
+/// convert directly to and from the codepoint observed on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum EcnCodepoint {
+    /// Not ECN-Capable Transport.
+    NotEct = 0,
+
+    /// ECN-Capable Transport, codepoint 1.
+    Ect1   = 1,
+
+    /// ECN-Capable Transport, codepoint 0.
+    Ect0   = 2,
+
+    /// Congestion Experienced.
+    Ce     = 3,
+}
+
 /// Ancillary information about incoming packets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecvInfo {
@@ -586,6 +607,10 @@ pub struct Config {
     /// Send rate limit in Mbps
     max_pacing_rate: Option<u64>,
 
+    /// Whether to attempt ECN(0) marking and validation on the CUBIC
+    /// congestion controller's original path.
+    enable_ecn: bool,
+
     tx_cap_factor: f64,
 
     dgram_recv_max_queue_len: usize,
@@ -663,6 +688,8 @@ impl Config {
             hystart: true,
             pacing: true,
             max_pacing_rate: None,
+
+            enable_ecn: false,
 
             tx_cap_factor: TX_CAP_FACTOR,
 
@@ -1171,6 +1198,25 @@ impl Config {
         self.max_pacing_rate = Some(v);
     }
 
+    /// Configures whether to attempt ECN(0) marking and validation.
+    ///
+    /// This is only attempted on the CUBIC congestion controller, and only
+    /// while the connection has a single network path; it is silently
+    /// ignored otherwise. Callers must use [`send_with_ecn()`] or
+    /// [`send_on_path_with_ecn()`] to learn which codepoint to apply to the
+    /// outgoing UDP datagram, since [`send()`] and [`send_on_path()`] do not
+    /// report it.
+    ///
+    /// The default value is `false`.
+    ///
+    /// [`send_with_ecn()`]: struct.Connection.html#method.send_with_ecn
+    /// [`send_on_path_with_ecn()`]: struct.Connection.html#method.send_on_path_with_ecn
+    /// [`send()`]: struct.Connection.html#method.send
+    /// [`send_on_path()`]: struct.Connection.html#method.send_on_path
+    pub fn enable_ecn(&mut self, v: bool) {
+        self.enable_ecn = v;
+    }
+
     /// Configures whether to enable receiving DATAGRAM frames.
     ///
     /// When enabled, the `max_datagram_frame_size` transport parameter is set
@@ -1589,6 +1635,10 @@ where
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// Sender-side ECN validation state, present only while attempting
+    /// ECN(0) marking on this connection's single network path.
+    ecn_sender: Option<ecn::EcnSender>,
 }
 
 /// Creates a new server-side connection.
@@ -2213,6 +2263,10 @@ impl<F: BufFactory> Connection<F> {
             streams_blocked_uni_state: Default::default(),
 
             max_amplification_factor: config.max_amplification_factor,
+
+            ecn_sender: (config.enable_ecn &&
+                config.cc_algorithm == CongestionControlAlgorithm::CUBIC)
+                .then(ecn::EcnSender::new),
         };
         if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
@@ -9519,6 +9573,7 @@ mod buffers;
 mod cid;
 mod crypto;
 mod dgram;
+mod ecn;
 mod error;
 #[cfg(feature = "ffi")]
 mod ffi;
