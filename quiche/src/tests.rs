@@ -8193,7 +8193,13 @@ fn handshake_packet_type_corruption(
     let active_pid = pipe.client.paths.get_active_path_id().expect("no active");
     let (ty, len) = pipe
         .client
-        .send_single(&mut buf, active_pid, false, Instant::now())
+        .send_single(
+            &mut buf,
+            active_pid,
+            false,
+            Instant::now(),
+            EcnCodepoint::NotEct,
+        )
         .unwrap();
     assert_eq!(ty, Type::Initial);
 
@@ -8202,7 +8208,13 @@ fn handshake_packet_type_corruption(
     // Client sends Handshake packet.
     let (ty, len) = pipe
         .client
-        .send_single(&mut buf, active_pid, false, Instant::now())
+        .send_single(
+            &mut buf,
+            active_pid,
+            false,
+            Instant::now(),
+            EcnCodepoint::NotEct,
+        )
         .unwrap();
     assert_eq!(ty, Type::Handshake);
 

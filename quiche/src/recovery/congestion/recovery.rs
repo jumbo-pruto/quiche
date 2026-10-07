@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use std::collections::VecDeque;
 
+use super::CongestionEventCause;
 use super::RecoveryConfig;
 use super::Sent;
 
@@ -196,6 +197,7 @@ impl RecoveryEpoch {
                         delivered_time: unacked.delivered_time,
                         first_sent_time: unacked.first_sent_time,
                         is_app_limited: unacked.is_app_limited,
+                        ecn: unacked.ecn,
                     });
 
                     trace!("{} packet newly acked {}", trace_id, unacked.pkt_num);
@@ -388,6 +390,16 @@ pub struct LegacyRecovery {
 
     /// A resusable list of acks.
     newly_acked: Vec<Acked>,
+
+    /// Number of packets newly acknowledged by the most recently processed
+    /// ACK frame that this endpoint had sent with the ECT(0) codepoint.
+    newly_acked_ect0: u64,
+
+    /// Send time of the largest packet newly acknowledged by the most
+    /// recently processed ACK frame, used to gate an ECN-triggered
+    /// congestion event the same way loss detection gates on the largest
+    /// lost packet's send time.
+    newly_acked_largest_time_sent: Option<Instant>,
 }
 
 impl LegacyRecovery {
@@ -429,6 +441,10 @@ impl LegacyRecovery {
             congestion: Congestion::from_config(recovery_config),
 
             newly_acked: Vec::new(),
+
+            newly_acked_ect0: 0,
+
+            newly_acked_largest_time_sent: None,
         }
     }
 
@@ -551,7 +567,8 @@ impl LegacyRecovery {
                 &mut self.congestion,
                 self.bytes_in_flight.get(),
                 loss.lost_bytes,
-                &pkt,
+                pkt.time_sent,
+                CongestionEventCause::Loss,
                 now,
             );
 
@@ -696,16 +713,32 @@ impl RecoveryOps for LegacyRecovery {
             self.time_thresh = PACKET_REORDER_TIME_THRESHOLD;
         }
 
-        // Undo congestion window update.
-        if has_in_flight_spurious_loss {
+        // Undo congestion window update. A packet already declared lost
+        // turning out to be spurious doesn't invalidate a reduction that was
+        // actually caused by a validated ECN CE mark, so only roll back a
+        // loss-triggered episode.
+        if has_in_flight_spurious_loss &&
+            self.congestion.last_congestion_event_cause() !=
+                Some(CongestionEventCause::Ecn)
+        {
             (self.congestion.cc_ops.rollback)(&mut self.congestion);
         }
+
+        self.newly_acked_ect0 = 0;
+        self.newly_acked_largest_time_sent = None;
 
         if self.newly_acked.is_empty() {
             return Ok(OnAckReceivedOutcome::default());
         }
 
+        self.newly_acked_ect0 = self
+            .newly_acked
+            .iter()
+            .filter(|a| a.ecn == crate::EcnCodepoint::Ect0)
+            .count() as u64;
+
         let largest_newly_acked = self.newly_acked.last().unwrap();
+        self.newly_acked_largest_time_sent = Some(largest_newly_acked.time_sent);
 
         // Update `largest_acked_packet` based on the validated `newly_acked`
         // value.
@@ -755,6 +788,29 @@ impl RecoveryOps for LegacyRecovery {
             acked_bytes,
             spurious_losses,
         })
+    }
+
+    fn newly_acked_ect0(&self) -> u64 {
+        self.newly_acked_ect0
+    }
+
+    fn on_ecn_ce_event(&mut self, now: Instant) {
+        let Some(time_sent) = self.newly_acked_largest_time_sent else {
+            return;
+        };
+
+        if !self.congestion.in_congestion_recovery(time_sent) {
+            (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
+        }
+
+        (self.congestion.cc_ops.congestion_event)(
+            &mut self.congestion,
+            self.bytes_in_flight.get(),
+            0,
+            time_sent,
+            CongestionEventCause::Ecn,
+            now,
+        );
     }
 
     fn on_loss_detection_timeout(
@@ -1149,6 +1205,10 @@ pub struct Acked {
     pub first_sent_time: Instant,
 
     pub is_app_limited: bool,
+
+    /// The ECN codepoint this endpoint marked this packet with when it was
+    /// sent.
+    pub ecn: crate::EcnCodepoint,
 }
 
 #[cfg(test)]

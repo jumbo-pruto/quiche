@@ -1513,7 +1513,7 @@ where
     draining_timer: Option<Instant>,
 
     /// List of raw packets that were received before they could be decrypted.
-    undecryptable_pkts: VecDeque<(Vec<u8>, RecvInfo)>,
+    undecryptable_pkts: VecDeque<(Vec<u8>, RecvInfo, Option<EcnCodepoint>)>,
 
     /// The negotiated ALPN protocol.
     alpn: Vec<u8>,
@@ -2871,6 +2871,23 @@ impl<F: BufFactory> Connection<F> {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn recv(&mut self, buf: &mut [u8], info: RecvInfo) -> Result<usize> {
+        self.recv_with_ecn(buf, info, None)
+    }
+
+    /// Same as [`recv()`], but additionally records the ECN codepoint
+    /// observed on the IP header of the received datagram, as described in
+    /// [RFC 9000 Section 13.4.1].
+    ///
+    /// `ecn` must be `None` when the application could not determine the
+    /// codepoint, for example because the platform or socket does not
+    /// support reading it. It must be `Some(EcnCodepoint::NotEct)`, not
+    /// `None`, when the codepoint was read and found to be Not-ECT.
+    ///
+    /// [`recv()`]: struct.Connection.html#method.recv
+    /// [RFC 9000 Section 13.4.1]: https://www.rfc-editor.org/rfc/rfc9000#section-13.4.1
+    pub fn recv_with_ecn(
+        &mut self, buf: &mut [u8], info: RecvInfo, ecn: Option<EcnCodepoint>,
+    ) -> Result<usize> {
         let len = buf.len();
 
         if len == 0 {
@@ -2917,6 +2934,7 @@ impl<F: BufFactory> Connection<F> {
                 &mut buf[len - left..len],
                 &info,
                 recv_pid,
+                ecn,
             ) {
                 Ok(v) => v,
 
@@ -2959,9 +2977,10 @@ impl<F: BufFactory> Connection<F> {
             .crypto_0rtt_open
             .is_some()
         {
-            while let Some((mut pkt, info)) = self.undecryptable_pkts.pop_front()
+            while let Some((mut pkt, info, ecn)) =
+                self.undecryptable_pkts.pop_front()
             {
-                if let Err(e) = self.recv(&mut pkt, info) {
+                if let Err(e) = self.recv_with_ecn(&mut pkt, info, ecn) {
                     self.undecryptable_pkts.clear();
 
                     return Err(e);
@@ -3012,6 +3031,7 @@ impl<F: BufFactory> Connection<F> {
     /// [`Done`]: enum.Error.html#variant.Done
     fn recv_single(
         &mut self, buf: &mut [u8], info: &RecvInfo, recv_pid: Option<usize>,
+        ecn: Option<EcnCodepoint>,
     ) -> Result<usize> {
         let now = Instant::now();
 
@@ -3283,7 +3303,7 @@ impl<F: BufFactory> Connection<F> {
                     let pkt_len = b.off() + payload_len;
                     let pkt = (b.buf()[..pkt_len]).to_vec();
 
-                    self.undecryptable_pkts.push_back((pkt, *info));
+                    self.undecryptable_pkts.push_back((pkt, *info, ecn));
                     return Ok(pkt_len);
                 }
 
@@ -3802,6 +3822,7 @@ impl<F: BufFactory> Connection<F> {
         }
 
         self.pkt_num_spaces[epoch].recv_pkt_num.insert(pn);
+        self.pkt_num_spaces[epoch].record_ecn(ecn);
 
         self.pkt_num_spaces[epoch].recv_pkt_need_ack.push_item(pn);
 
@@ -3922,6 +3943,18 @@ impl<F: BufFactory> Connection<F> {
         self.send_on_path(out, None, None)
     }
 
+    /// Same as [`send()`], but also returns the ECN codepoint that the
+    /// application should apply to the IP header of the outgoing UDP
+    /// datagram, as decided by [`Config::enable_ecn()`].
+    ///
+    /// [`send()`]: struct.Connection.html#method.send
+    /// [`Config::enable_ecn()`]: struct.Config.html#method.enable_ecn
+    pub fn send_with_ecn(
+        &mut self, out: &mut [u8],
+    ) -> Result<(usize, SendInfo, EcnCodepoint)> {
+        self.send_on_path_with_ecn(out, None, None)
+    }
+
     /// Writes a single QUIC packet to be sent to the peer from the specified
     /// local address `from` to the destination address `to`.
     ///
@@ -4009,6 +4042,20 @@ impl<F: BufFactory> Connection<F> {
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
         to: Option<SocketAddr>,
     ) -> Result<(usize, SendInfo)> {
+        let (written, info, _ecn) = self.send_on_path_with_ecn(out, from, to)?;
+        Ok((written, info))
+    }
+
+    /// Same as [`send_on_path()`], but also returns the ECN codepoint that
+    /// the application should apply to the IP header of the outgoing UDP
+    /// datagram, as decided by [`Config::enable_ecn()`].
+    ///
+    /// [`send_on_path()`]: struct.Connection.html#method.send_on_path
+    /// [`Config::enable_ecn()`]: struct.Config.html#method.enable_ecn
+    pub fn send_on_path_with_ecn(
+        &mut self, out: &mut [u8], from: Option<SocketAddr>,
+        to: Option<SocketAddr>,
+    ) -> Result<(usize, SendInfo, EcnCodepoint)> {
         if out.is_empty() {
             return Err(Error::BufferTooShort);
         }
@@ -4079,6 +4126,29 @@ impl<F: BufFactory> Connection<F> {
             left = cmp::min(left, send_path.max_send_bytes);
         }
 
+        // Decide the ECN codepoint once for the whole datagram, before any
+        // of its (possibly coalesced) QUIC packets are built; RFC 9000
+        // Section 13.4.1 applies one IP-layer marking to the whole datagram.
+        //
+        // Marking is only attempted while this connection has never had more
+        // than one network path: once a competing path appears, ECN marking
+        // is disabled for the rest of the connection's lifetime, even if the
+        // connection later drops back down to a single path.
+        //
+        // This only peeks at the codepoint: the testing budget is only
+        // consumed once it's confirmed below that a datagram is actually
+        // being sent, to avoid wasting it on calls that end up returning
+        // `Done`.
+        if self.paths.len() > 1 {
+            self.ecn_sender = None;
+        }
+
+        let ecn = self
+            .ecn_sender
+            .as_ref()
+            .map(|s| s.current_codepoint())
+            .unwrap_or(EcnCodepoint::NotEct);
+
         // Generate coalesced packets.
         while left > 0 {
             let (ty, written) = match self.send_single(
@@ -4086,6 +4156,7 @@ impl<F: BufFactory> Connection<F> {
                 send_pid,
                 has_initial,
                 now,
+                ecn,
             ) {
                 Ok(v) => v,
 
@@ -4128,6 +4199,12 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::Done);
         }
 
+        // A datagram using `ecn` is definitely being sent: commit the
+        // testing budget now.
+        if let Some(sender) = self.ecn_sender.as_mut() {
+            sender.commit_sent();
+        }
+
         if has_initial && left > 0 && done < MIN_CLIENT_INITIAL_LEN {
             let pad_len = cmp::min(left, MIN_CLIENT_INITIAL_LEN - done);
 
@@ -4147,12 +4224,12 @@ impl<F: BufFactory> Connection<F> {
             at: send_path.recovery.get_packet_send_time(now),
         };
 
-        Ok((done, info))
+        Ok((done, info, ecn))
     }
 
     fn send_single(
         &mut self, out: &mut [u8], send_pid: usize, has_initial: bool,
-        now: Instant,
+        now: Instant, ecn: EcnCodepoint,
     ) -> Result<(Type, usize)> {
         if out.is_empty() {
             return Err(Error::BufferTooShort);
@@ -4601,7 +4678,7 @@ impl<F: BufFactory> Connection<F> {
             let frame = frame::Frame::ACK {
                 ack_delay,
                 ranges: pkt_space.recv_pkt_need_ack.clone(),
-                ecn_counts: None, // sending ECN is not supported at this time
+                ecn_counts: pkt_space.ecn_counts(),
             };
 
             // When a PING frame needs to be sent, avoid sending the ACK if
@@ -5506,6 +5583,7 @@ impl<F: BufFactory> Connection<F> {
             lost: 0,
             has_data: sent_pkt_has_data,
             is_pmtud_probe,
+            ecn,
         };
 
         if in_flight && is_app_limited {
@@ -8332,7 +8410,10 @@ impl<F: BufFactory> Connection<F> {
             frame::Frame::Ping { .. } => (),
 
             frame::Frame::ACK {
-                ranges, ack_delay, ..
+                ranges,
+                ack_delay,
+                ecn_counts,
+                ..
             } => {
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
@@ -8354,6 +8435,19 @@ impl<F: BufFactory> Connection<F> {
                 let largest_acked = ranges.last().expect(
                     "ACK frames should always have at least one ack range",
                 );
+
+                // ECN validation (RFC 9000 Section 13.4.2) is only
+                // attempted while this connection has never had more than
+                // one network path: once a competing path appears, ECN
+                // marking/validation is disabled for the rest of the
+                // connection's lifetime. Capture this before the loop
+                // below, since `self.paths` is borrowed mutably inside it.
+                if self.paths.len() > 1 {
+                    self.ecn_sender = None;
+                }
+
+                let peer_ecn_counts =
+                    ecn_counts.map(|c| (c.ect0_count, c.ecn_ce_count));
 
                 for (_, p) in self.paths.iter_mut() {
                     if self.pkt_num_spaces[epoch]
@@ -8385,6 +8479,17 @@ impl<F: BufFactory> Connection<F> {
                         self.pkt_num_manager.skip_pn(),
                         &self.trace_id,
                     )?;
+
+                    if let Some(ecn_sender) = self.ecn_sender.as_mut() {
+                        let ce_event = ecn_sender.validate(
+                            peer_ecn_counts,
+                            p.recovery.newly_acked_ect0(),
+                        );
+
+                        if ce_event {
+                            p.recovery.on_ecn_ce_event(now);
+                        }
+                    }
 
                     let skip_pn = self.pkt_num_manager.skip_pn();
                     let largest_acked =

@@ -406,6 +406,7 @@ mod tests {
                 delivered_time: now,
                 first_sent_time: now.checked_sub(rtt).unwrap(),
                 is_app_limited: false,
+                ecn: crate::EcnCodepoint::NotEct,
             };
 
             r.congestion.delivery_rate.update_rate_sample(&acked, now);

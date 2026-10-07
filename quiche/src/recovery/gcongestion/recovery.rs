@@ -895,6 +895,15 @@ impl RecoveryOps for GRecovery {
         })
     }
 
+    // gcongestion never marks outgoing packets with an ECN codepoint.
+    fn newly_acked_ect0(&self) -> u64 {
+        0
+    }
+
+    // gcongestion never marks outgoing packets with an ECN codepoint, so it
+    // never has a validated CE mark to respond to.
+    fn on_ecn_ce_event(&mut self, _now: Instant) {}
+
     fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
         trace_id: &str,

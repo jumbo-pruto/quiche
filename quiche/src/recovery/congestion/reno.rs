@@ -33,7 +33,6 @@ use std::time::Instant;
 
 use super::rtt::RttStats;
 use super::Acked;
-use super::Sent;
 
 use super::Congestion;
 use super::CongestionControlOps;
@@ -108,12 +107,10 @@ fn on_packet_acked(
 
 fn congestion_event(
     r: &mut Congestion, _bytes_in_flight: usize, _lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    time_sent: Instant, _cause: super::CongestionEventCause, now: Instant,
 ) {
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.
-    let time_sent = largest_lost_pkt.time_sent;
-
     if !r.in_congestion_recovery(time_sent) {
         r.congestion_recovery_start_time = Some(now);
 

@@ -36,6 +36,18 @@ use crate::recovery::CongestionControlAlgorithm;
 use crate::StartupExit;
 use crate::StartupExitReason;
 
+/// What triggered a congestion control response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CongestionEventCause {
+    /// A packet was declared lost.
+    Loss,
+
+    /// A newly acknowledged packet was reported by the peer as having
+    /// experienced ECN congestion marking (CE), and this was validated per
+    /// RFC 9000 Section 13.4.2.1.
+    Ecn,
+}
+
 pub struct SsThresh {
     // Current slow start threshold.  Defaults to usize::MAX which
     // indicates we're still in the initial slow start phase.
@@ -175,6 +187,16 @@ impl Congestion {
         }
     }
 
+    /// What triggered the current congestion recovery episode, if any.
+    ///
+    /// Only meaningful for CUBIC; always `None` for Reno, which never
+    /// receives an ECN-caused event.
+    pub(crate) fn last_congestion_event_cause(
+        &self,
+    ) -> Option<CongestionEventCause> {
+        self.cubic_state.last_event_cause
+    }
+
     /// The most recent data delivery rate estimate.
     pub(crate) fn delivery_rate(&self) -> Bandwidth {
         self.delivery_rate.sample_delivery_rate()
@@ -266,7 +288,8 @@ pub(crate) struct CongestionControlOps {
         r: &mut Congestion,
         bytes_in_flight: usize,
         lost_bytes: usize,
-        largest_lost_packet: &Sent,
+        time_sent: Instant,
+        cause: CongestionEventCause,
         now: Instant,
     ),
 
