@@ -1,0 +1,6 @@
+{"qlog_version": "0.3", "qlog_format": "JSON-SEQ", "trace": {"vantage_point": {"type": "server"}, "title": "abe-lab-fixture"}}
+{"time": 1000.0, "name": "quic:recovery_metrics_updated", "data": {"min_rtt": 20.0, "smoothed_rtt": 20.0, "latest_rtt": 20.0, "congestion_window": 14000, "bytes_in_flight": 14000, "ssthresh": 18446744073709551615}}
+{"time": 1050.0, "name": "quic:recovery_metrics_updated", "data": {"congestion_window": 15400, "bytes_in_flight": 15400}}
+{"time": 1100.0, "name": "quic:recovery_metrics_updated", "data": {"latest_rtt": 22.0, "congestion_window": 16800, "bytes_in_flight": 16800}}
+{"time": 1150.0, "name": "quic:recovery_metrics_updated", "data": {"congestion_window": 9800, "ssthresh": 9800, "bytes_in_flight": 16800}}
+{"time": 1200.0, "name": "quic:recovery_metrics_updated", "data": {"congestion_window": 10150}}
