@@ -141,6 +141,8 @@ pub struct RecoveryConfig {
     pub initial_congestion_window_packets: usize,
     pub enable_relaxed_loss_threshold: bool,
     pub enable_cubic_idle_restart_fix: bool,
+    pub ecn_enabled: bool,
+    pub ecn_use_ect1: bool,
 }
 
 impl RecoveryConfig {
@@ -158,6 +160,8 @@ impl RecoveryConfig {
                 .initial_congestion_window_packets,
             enable_relaxed_loss_threshold: config.enable_relaxed_loss_threshold,
             enable_cubic_idle_restart_fix: config.enable_cubic_idle_restart_fix,
+            ecn_enabled: config.ecn_enabled,
+            ecn_use_ect1: config.ecn_use_ect1,
         }
     }
 }
@@ -216,7 +220,8 @@ pub trait RecoveryOps {
 
     #[allow(clippy::too_many_arguments)]
     fn on_ack_received(
-        &mut self, ranges: &RangeSet, ack_delay: u64, epoch: packet::Epoch,
+        &mut self, ranges: &RangeSet, ack_delay: u64,
+        ecn_counts: Option<packet::EcnCounts>, epoch: packet::Epoch,
         handshake_status: HandshakeStatus, now: Instant, skip_pn: Option<u64>,
         trace_id: &str,
     ) -> Result<OnAckReceivedOutcome>;
@@ -326,6 +331,17 @@ pub trait RecoveryOps {
     fn get_next_release_time(&self) -> ReleaseDecision;
 
     fn gcongestion_enabled(&self) -> bool;
+
+    // ECN (PR #1351): the ECN state lives in the recovery of each path.
+    fn ecn_value_to_send(&mut self) -> u8;
+
+    fn is_next_sent_pkt_ecn_marked(&self) -> bool;
+
+    fn ecn_counts(&self) -> [packet::EcnCounts; packet::Epoch::count()];
+
+    fn ecn_reset(
+        &mut self, base_ecn_counts: [packet::EcnCounts; packet::Epoch::count()],
+    );
 }
 
 impl Recovery {
@@ -432,6 +448,8 @@ pub struct Sent {
     pub has_data: bool,
 
     pub is_pmtud_probe: bool,
+
+    pub ecn_marked: bool,
 }
 
 impl std::fmt::Debug for Sent {
@@ -984,6 +1002,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1015,6 +1034,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1046,6 +1066,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1076,6 +1097,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1100,6 +1122,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1146,6 +1169,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1176,6 +1200,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1201,6 +1226,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1270,6 +1296,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1300,6 +1327,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1330,6 +1358,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1360,6 +1389,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -1385,6 +1415,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1477,6 +1508,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1507,6 +1539,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1624,6 +1657,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1651,6 +1685,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1682,6 +1717,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1711,6 +1747,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1799,6 +1836,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1827,6 +1865,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1866,6 +1905,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1898,6 +1938,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -1963,6 +2004,7 @@ mod tests {
                 lost: 0,
                 has_data: true,
                 is_pmtud_probe: false,
+                ecn_marked: false,
             };
 
             r.on_packet_sent(
@@ -1999,6 +2041,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 10,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -2041,6 +2084,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2081,6 +2125,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2113,6 +2158,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2169,6 +2215,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 0,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -2198,6 +2245,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 0,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -2240,6 +2288,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 0,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -2411,6 +2460,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 epoch,
                 HandshakeStatus::default(),
                 now,
@@ -2439,6 +2489,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 epoch,
                 HandshakeStatus::default(),
                 now,
@@ -2492,6 +2543,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2524,6 +2576,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: true,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2553,6 +2606,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(
@@ -2577,6 +2631,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -2666,6 +2721,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 25,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now + interval,
@@ -2745,6 +2801,7 @@ mod tests {
             r.on_ack_received(
                 &acked,
                 10,
+                None,
                 packet::Epoch::Application,
                 HandshakeStatus::default(),
                 now,
@@ -2800,6 +2857,7 @@ mod tests {
                 r.on_ack_received(
                     &acked,
                     10,
+                    None,
                     packet::Epoch::Application,
                     HandshakeStatus::default(),
                     now,
@@ -2873,6 +2931,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
         r.on_packet_sent(
             p_initial,
@@ -2904,6 +2963,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
         r.on_packet_sent(
             p_app,
@@ -2921,6 +2981,7 @@ mod tests {
         r.on_ack_received(
             &ranges,
             0,
+            None,
             packet::Epoch::Initial,
             handshake_status,
             now,
@@ -2972,6 +3033,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         r.on_packet_sent(

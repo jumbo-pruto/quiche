@@ -495,8 +495,8 @@ fn congestion_event(
     if !in_congestion_recovery {
         let cwnd_before = r.congestion_window;
         let dbg_before = r.congestion_window / r.max_datagram_size;
-        let dbg_age_ms = now.saturating_duration_since(time_sent).as_secs_f64() *
-            1000.0;
+        let dbg_age_ms =
+            now.saturating_duration_since(time_sent).as_secs_f64() * 1000.0;
         r.congestion_recovery_start_time = Some(now);
 
         // Fast convergence

@@ -896,6 +896,7 @@ fn crypto_limit(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) 
 
     let active_path = pipe.server.paths.get_active().unwrap();
     let info = RecvInfo {
+        ecn: 0,
         to: active_path.local_addr(),
         from: active_path.peer_addr(),
     };
@@ -3051,6 +3052,7 @@ fn streams_blocked_bidi_retransmit(
     // Deliver it to the server.
     let server_path = &pipe.server.paths.get_active().unwrap();
     let info = RecvInfo {
+        ecn: 0,
         to: server_path.local_addr(),
         from: server_path.peer_addr(),
     };
@@ -3127,6 +3129,7 @@ fn streams_blocked_uni_retransmit(
     // frame) to the server.
     let server_path = &pipe.server.paths.get_active().unwrap();
     let info = RecvInfo {
+        ecn: 0,
         to: server_path.local_addr(),
         from: server_path.peer_addr(),
     };
@@ -8667,6 +8670,7 @@ fn retransmit_data_acked_before_fully_retransmitted(
     // Deliver original packets (delayed arrival).
     let server_path = &pipe.server.paths.get_active().unwrap();
     let server_info = RecvInfo {
+        ecn: 0,
         to: server_path.local_addr(),
         from: server_path.peer_addr(),
     };
@@ -10796,6 +10800,7 @@ fn connection_id_zero(
 
     let active_path = pipe.server.paths.get_active().unwrap();
     let info = RecvInfo {
+        ecn: 0,
         to: active_path.local_addr(),
         from: active_path.peer_addr(),
     };
@@ -10870,6 +10875,7 @@ fn connection_id_invalid_max_len(
 
     let active_path = pipe.server.paths.get_active().unwrap();
     let info = RecvInfo {
+        ecn: 0,
         to: active_path.local_addr(),
         from: active_path.peer_addr(),
     };
@@ -11159,6 +11165,7 @@ fn connection_id_retire_limit(
 
     let active_path = pipe.server.paths.get_active().unwrap();
     let info = RecvInfo {
+        ecn: 0,
         to: active_path.local_addr(),
         from: active_path.peer_addr(),
     };
@@ -11814,6 +11821,7 @@ fn send_on_path_test(
     assert_eq!(si.to, server_addr);
 
     let ri = RecvInfo {
+        ecn: 0,
         to: si.to,
         from: si.from,
     };
@@ -11858,6 +11866,7 @@ fn send_on_path_test(
     assert_eq!(si.to, server_addr_2);
 
     let ri = RecvInfo {
+        ecn: 0,
         to: si.to,
         from: si.from,
     };
@@ -11875,6 +11884,7 @@ fn send_on_path_test(
     assert_eq!(si.to, server_addr);
 
     let ri = RecvInfo {
+        ecn: 0,
         to: si.to,
         from: si.from,
     };
@@ -11893,6 +11903,7 @@ fn send_on_path_test(
     assert_eq!(si.to, server_addr);
 
     let ri = RecvInfo {
+        ecn: 0,
         to: si.to,
         from: si.from,
     };
@@ -11910,6 +11921,7 @@ fn send_on_path_test(
     assert_eq!(si.to, server_addr);
 
     let ri = RecvInfo {
+        ecn: 0,
         to: si.to,
         from: si.from,
     };
@@ -12480,6 +12492,7 @@ fn path_event_queue_bounded_on_port_rotation(
         .unwrap();
 
         let info = RecvInfo {
+            ecn: 0,
             to: server_addr,
             from: format!("127.0.0.1:{}", 20000 + port).parse().unwrap(),
         };
@@ -12978,6 +12991,7 @@ fn challenge_no_cids(
 
     pipe.server
         .recv(&mut pkt_buf[..written], RecvInfo {
+            ecn: 0,
             to: server_addr,
             from: client_addr_2,
         })

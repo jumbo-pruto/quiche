@@ -86,6 +86,7 @@ impl TestSender {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn_marked: false,
         };
 
         self.cc.on_packet_sent(

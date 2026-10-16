@@ -882,6 +882,8 @@ pub struct PktNumSpace {
 
     /// Track if a received packet is ack eliciting.
     pub ack_elicited: bool,
+
+    pub ecn_counts: Option<EcnCounts>,
 }
 
 impl PktNumSpace {
@@ -894,6 +896,8 @@ impl PktNumSpace {
             recv_pkt_need_ack: ranges::RangeSet::new(crate::MAX_ACK_RANGES),
             recv_pkt_num: PktNumWindow::default(),
             ack_elicited: false,
+
+            ecn_counts: None,
         }
     }
 
@@ -1164,6 +1168,13 @@ impl PktNumWindow {
     fn upper(&self) -> u64 {
         self.lower.saturating_add(size_of::<u128>() as u64 * 8) - 1
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EcnCounts {
+    pub ect0_count: u64,
+    pub ect1_count: u64,
+    pub ecn_ce_count: u64,
 }
 
 #[cfg(test)]

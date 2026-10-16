@@ -34,6 +34,8 @@ use std::collections::VecDeque;
 use super::RecoveryConfig;
 use super::Sent;
 
+use crate::ecn;
+use crate::packet;
 use crate::packet::Epoch;
 use crate::ranges::RangeSet;
 use crate::recovery::Bandwidth;
@@ -106,6 +108,8 @@ struct AckedDetectionResult {
     spurious_pkt_thresh: Option<u64>,
     has_ack_eliciting: bool,
     has_in_flight_spurious_loss: bool,
+    largest_newly_acked_size: usize,
+    newly_ecn_marked_acked: u64,
 }
 
 struct LossDetectionResult {
@@ -113,6 +117,7 @@ struct LossDetectionResult {
     lost_packets: usize,
     lost_bytes: usize,
     pmtud_lost_bytes: usize,
+    lost_ecn_marked_ack_eliciting_packets: u64,
 }
 
 impl RecoveryEpoch {
@@ -129,6 +134,8 @@ impl RecoveryEpoch {
         let mut spurious_pkt_thresh = None;
         let mut has_ack_eliciting = false;
         let mut has_in_flight_spurious_loss = false;
+        let mut largest_newly_acked_size = 0;
+        let mut newly_ecn_marked_acked = 0;
 
         let largest_ack_received = peer_sent_ack_ranges
             .last()
@@ -186,6 +193,12 @@ impl RecoveryEpoch {
                         acked_bytes += unacked.size;
                     }
 
+                    largest_newly_acked_size = unacked.size;
+
+                    if unacked.ecn_marked {
+                        newly_ecn_marked_acked += 1;
+                    }
+
                     newly_acked.push(Acked {
                         pkt_num: unacked.pkt_num,
                         time_sent: unacked.time_sent,
@@ -217,6 +230,8 @@ impl RecoveryEpoch {
             spurious_pkt_thresh,
             has_ack_eliciting,
             has_in_flight_spurious_loss,
+            largest_newly_acked_size,
+            newly_ecn_marked_acked,
         })
     }
 
@@ -236,6 +251,7 @@ impl RecoveryEpoch {
         let mut lost_packets = 0;
         let mut lost_bytes = 0;
         let mut pmtud_lost_bytes = 0;
+        let mut lost_ecn_marked_ack_eliciting_packets = 0;
 
         let mut largest_lost_pkt = None;
 
@@ -255,6 +271,10 @@ impl RecoveryEpoch {
                 self.lost_frames_ack.extend(unacked.frames.drain(..));
 
                 unacked.time_lost = Some(now);
+
+                if unacked.ack_eliciting && unacked.ecn_marked {
+                    lost_ecn_marked_ack_eliciting_packets += 1;
+                }
 
                 if unacked.is_pmtud_probe {
                     pmtud_lost_bytes += unacked.size;
@@ -300,6 +320,7 @@ impl RecoveryEpoch {
             lost_packets,
             lost_bytes,
             pmtud_lost_bytes,
+            lost_ecn_marked_ack_eliciting_packets,
         }
     }
 
@@ -389,6 +410,8 @@ pub struct LegacyRecovery {
 
     /// A resusable list of acks.
     newly_acked: Vec<Acked>,
+
+    pub ecn: ecn::Ecn,
 }
 
 impl LegacyRecovery {
@@ -430,6 +453,12 @@ impl LegacyRecovery {
             congestion: Congestion::from_config(recovery_config),
 
             newly_acked: Vec::new(),
+
+            ecn: ecn::Ecn::new(
+                recovery_config.ecn_enabled,
+                recovery_config.ecn_use_ect1,
+                [packet::EcnCounts::default(); Epoch::count()],
+            ),
         }
     }
 
@@ -576,12 +605,58 @@ impl LegacyRecovery {
         self.bytes_in_flight
             .saturating_subtract(loss.pmtud_lost_bytes, now);
 
+        self.ecn
+            .on_packets_lost(loss.lost_ecn_marked_ack_eliciting_packets);
+
         self.epochs[epoch]
             .drain_acked_and_lost_packets(now - self.rtt_stats.rtt());
 
         self.congestion.lost_count += loss.lost_packets;
 
         (loss.lost_packets, loss.lost_bytes)
+    }
+
+    fn process_ecn(
+        &mut self, newly_ecn_marked_acked: u64,
+        ecn_counts: Option<packet::EcnCounts>, largest_acked_size: usize,
+        largest_acked_sent: &Sent, epoch: Epoch, now: Instant,
+    ) {
+        let ce =
+            self.ecn
+                .on_ack_received(epoch, newly_ecn_marked_acked, ecn_counts);
+        if ce > 0 {
+            let dbg_new_event = !self
+                .congestion
+                .in_congestion_recovery(largest_acked_sent.time_sent);
+            eprintln!(
+                "ECNDBG epoch={:.6} ce_increase={} new_event={} cwnd={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+                ce,
+                dbg_new_event,
+                self.congestion.congestion_window /
+                    self.congestion.max_datagram_size
+            );
+
+            // PR #1351: Recovery::congestion_event(largest_acked_size,
+            // largest_acked_sent, epoch, now).
+            if !self
+                .congestion
+                .in_congestion_recovery(largest_acked_sent.time_sent)
+            {
+                (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
+            }
+
+            (self.congestion.cc_ops.congestion_event)(
+                &mut self.congestion,
+                self.bytes_in_flight.get(),
+                largest_acked_size,
+                largest_acked_sent,
+                now,
+            );
+        }
     }
 }
 
@@ -684,7 +759,8 @@ impl RecoveryOps for LegacyRecovery {
 
     // `peer_sent_ack_ranges` should not be used without validation.
     fn on_ack_received(
-        &mut self, peer_sent_ack_ranges: &RangeSet, ack_delay: u64, epoch: Epoch,
+        &mut self, peer_sent_ack_ranges: &RangeSet, ack_delay: u64,
+        ecn_counts: Option<packet::EcnCounts>, epoch: Epoch,
         handshake_status: HandshakeStatus, now: Instant, skip_pn: Option<u64>,
         trace_id: &str,
     ) -> Result<OnAckReceivedOutcome> {
@@ -694,6 +770,8 @@ impl RecoveryOps for LegacyRecovery {
             spurious_pkt_thresh,
             has_ack_eliciting,
             has_in_flight_spurious_loss,
+            largest_newly_acked_size,
+            newly_ecn_marked_acked,
         } = self.epochs[epoch].detect_and_remove_acked_packets(
             now,
             peer_sent_ack_ranges,
@@ -741,6 +819,37 @@ impl RecoveryOps for LegacyRecovery {
                 handshake_status.completed,
             );
         }
+
+        // PR #1351: process ECN counts before loss detection, keyed on the
+        // largest newly acked packet.
+        let largest_unacked = self.newly_acked.last().unwrap();
+        let largest_sent = Sent {
+            pkt_num: largest_unacked.pkt_num,
+            frames: Default::default(),
+            time_sent: largest_unacked.time_sent,
+            time_acked: Some(now),
+            time_lost: None,
+            size: largest_unacked.size,
+            ack_eliciting: true,
+            in_flight: true,
+            delivered: largest_unacked.delivered,
+            delivered_time: largest_unacked.delivered_time,
+            first_sent_time: largest_unacked.first_sent_time,
+            is_app_limited: largest_unacked.is_app_limited,
+            tx_in_flight: 0,
+            lost: 0,
+            has_data: true,
+            is_pmtud_probe: false,
+            ecn_marked: true,
+        };
+        self.process_ecn(
+            newly_ecn_marked_acked,
+            ecn_counts,
+            largest_newly_acked_size,
+            &largest_sent,
+            epoch,
+            now,
+        );
 
         // Detect and mark lost packets without removing them from the sent
         // packets list.
@@ -910,7 +1019,11 @@ impl RecoveryOps for LegacyRecovery {
             eprintln!("KNOBS no_prr={v}");
             v
         });
-        let prr = if no_prr { 0 } else { self.congestion.prr.snd_cnt };
+        let prr = if no_prr {
+            0
+        } else {
+            self.congestion.prr.snd_cnt
+        };
         // Open more space (snd_cnt) for PRR when allowed.
         self.cwnd().saturating_sub(self.bytes_in_flight.get()) + prr
     }
@@ -1111,6 +1224,24 @@ impl RecoveryOps for LegacyRecovery {
             time: ReleaseTime::Immediate,
             allow_burst: false,
         }
+    }
+
+    fn ecn_value_to_send(&mut self) -> u8 {
+        self.ecn.get_ecn_value_to_send()
+    }
+
+    fn is_next_sent_pkt_ecn_marked(&self) -> bool {
+        self.ecn.is_next_sent_pkt_ecn_marked()
+    }
+
+    fn ecn_counts(&self) -> [packet::EcnCounts; Epoch::count()] {
+        self.ecn.ecn_counts()
+    }
+
+    fn ecn_reset(
+        &mut self, base_ecn_counts: [packet::EcnCounts; Epoch::count()],
+    ) {
+        self.ecn.reset(base_ecn_counts);
     }
 
     fn gcongestion_enabled(&self) -> bool {

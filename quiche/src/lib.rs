@@ -116,13 +116,14 @@
 //! # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
 //! # let peer = "127.0.0.1:1234".parse().unwrap();
 //! # let local = "127.0.0.1:4321".parse().unwrap();
+//! # let ecn = 0;
 //! # let mut conn = quiche::accept(&scid, None, local, peer, &mut config)?;
 //! let to = socket.local_addr().unwrap();
 //!
 //! loop {
 //!     let (read, from) = socket.recv_from(&mut buf).unwrap();
 //!
-//!     let recv_info = quiche::RecvInfo { from, to };
+//!     let recv_info = quiche::RecvInfo { from, to, ecn };
 //!
 //!     let read = match conn.recv(&mut buf[..read], recv_info) {
 //!         Ok(v) => v,
@@ -514,6 +515,14 @@ pub struct RecvInfo {
 
     /// The local address the packet was received on.
     pub to: SocketAddr,
+
+    /// The ECN marking on the incoming packet.
+    ///
+    /// `0` means no ECN marking has been received, while non-zero values are
+    /// described in [RFC3168].
+    ///
+    /// [RFC3168]: https://datatracker.ietf.org/doc/html/rfc3168#section-5
+    pub ecn: u8,
 }
 
 /// Ancillary information about outgoing packets.
@@ -531,6 +540,9 @@ pub struct SendInfo {
     ///
     /// [Pacing]: index.html#pacing
     pub at: Instant,
+
+    /// The ECN marking for the outgoing packet.
+    pub ecn: u8,
 }
 
 /// The side of the stream to be shut down.
@@ -580,6 +592,9 @@ pub struct Config {
     initial_congestion_window_packets: usize,
     enable_relaxed_loss_threshold: bool,
     enable_cubic_idle_restart_fix: bool,
+
+    ecn_enabled: bool,
+    ecn_use_ect1: bool,
     enable_send_streams_blocked: bool,
 
     pmtud: bool,
@@ -662,6 +677,9 @@ impl Config {
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
             enable_relaxed_loss_threshold: false,
             enable_cubic_idle_restart_fix: true,
+
+            ecn_enabled: false,
+            ecn_use_ect1: false,
             enable_send_streams_blocked: false,
             pmtud: false,
             pmtud_max_probes: pmtud::MAX_PROBES_DEFAULT,
@@ -1155,6 +1173,21 @@ impl Config {
     /// The default value is `true`.
     pub fn set_enable_cubic_idle_restart_fix(&mut self, enable: bool) {
         self.enable_cubic_idle_restart_fix = enable;
+    }
+
+    /// Sets whether the QUIC connection should send packets with ECN support.
+    ///
+    /// The default value is `false`.
+    pub fn enable_ecn(&mut self, v: bool) {
+        self.ecn_enabled = v;
+    }
+
+    /// Sets whether the QUIC connection should send packets with ECN support
+    /// with ECT(1) marking instead of ECT(0).
+    ///
+    /// The default value is `false`.
+    pub fn set_ecn_use_ect1(&mut self, v: bool) {
+        self.ecn_use_ect1 = v;
     }
 
     /// Configure whether to enable sending STREAMS_BLOCKED frames.
@@ -2814,6 +2847,7 @@ impl<F: BufFactory> Connection<F> {
     /// # let scid = quiche::ConnectionId::from_ref(&[0xba; 16]);
     /// # let peer = "127.0.0.1:1234".parse().unwrap();
     /// # let local = socket.local_addr().unwrap();
+    /// # let ecn = 0;
     /// # let mut conn = quiche::accept(&scid, None, local, peer, &mut config)?;
     /// loop {
     ///     let (read, from) = socket.recv_from(&mut buf).unwrap();
@@ -2821,6 +2855,7 @@ impl<F: BufFactory> Connection<F> {
     ///     let recv_info = quiche::RecvInfo {
     ///         from,
     ///         to: local,
+    ///         ecn,
     ///     };
     ///
     ///     let read = match conn.recv(&mut buf[..read], recv_info) {
@@ -2839,6 +2874,10 @@ impl<F: BufFactory> Connection<F> {
 
         if len == 0 {
             return Err(Error::BufferTooShort);
+        }
+
+        if info.ecn > 0x03 {
+            return Err(Error::InvalidPacket);
         }
 
         let recv_pid = self.paths.path_id_from_addrs(&(info.to, info.from));
@@ -3723,6 +3762,29 @@ impl<F: BufFactory> Connection<F> {
         self.pkt_num_spaces[epoch].largest_rx_pkt_num =
             cmp::max(self.pkt_num_spaces[epoch].largest_rx_pkt_num, pn);
 
+        if info.ecn != ecn::ECN_NOT_ECT {
+            // Create the `EcnCounts` struct if this is the first non-zero ECN
+            // value received.
+            if self.pkt_num_spaces[epoch].ecn_counts.is_none() {
+                self.pkt_num_spaces[epoch].ecn_counts =
+                    Some(packet::EcnCounts::default());
+            }
+
+            if let Some(ref mut ecn_counts) =
+                self.pkt_num_spaces[epoch].ecn_counts
+            {
+                match info.ecn {
+                    ecn::ECN_ECT0 => ecn_counts.ect0_count += 1,
+
+                    ecn::ECN_ECT1 => ecn_counts.ect1_count += 1,
+
+                    ecn::ECN_CE => ecn_counts.ecn_ce_count += 1,
+
+                    e => warn!("{} invalid ECN value {}", self.trace_id, e),
+                };
+            }
+        }
+
         if !probing {
             self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num = cmp::max(
                 self.pkt_num_spaces[epoch].largest_rx_non_probing_pkt_num,
@@ -4050,13 +4112,15 @@ impl<F: BufFactory> Connection<F> {
             done += pad_len;
         }
 
-        let send_path = self.paths.get(send_pid)?;
+        let send_path = self.paths.get_mut(send_pid)?;
 
         let info = SendInfo {
             from: send_path.local_addr(),
             to: send_path.peer_addr(),
 
             at: send_path.recovery.get_packet_send_time(now),
+
+            ecn: send_path.recovery.ecn_value_to_send(),
         };
 
         Ok((done, info))
@@ -4613,7 +4677,7 @@ impl<F: BufFactory> Connection<F> {
             let frame = frame::Frame::ACK {
                 ack_delay,
                 ranges: pkt_space.recv_pkt_need_ack.clone(),
-                ecn_counts: None, // sending ECN is not supported at this time
+                ecn_counts: pkt_space.ecn_counts,
             };
 
             // When a PING frame needs to be sent, avoid sending the ACK if
@@ -5537,6 +5601,7 @@ impl<F: BufFactory> Connection<F> {
             lost: 0,
             has_data: sent_pkt_has_data,
             is_pmtud_probe,
+            ecn_marked: path.recovery.is_next_sent_pkt_ecn_marked(),
         };
 
         if in_flight && is_app_limited {
@@ -8397,7 +8462,9 @@ impl<F: BufFactory> Connection<F> {
             frame::Frame::Ping { .. } => (),
 
             frame::Frame::ACK {
-                ranges, ack_delay, ..
+                ranges,
+                ack_delay,
+                ecn_counts,
             } => {
                 let ack_delay = ack_delay
                     .checked_mul(2_u64.pow(
@@ -8444,6 +8511,7 @@ impl<F: BufFactory> Connection<F> {
                     } = p.recovery.on_ack_received(
                         &ranges,
                         ack_delay,
+                        ecn_counts,
                         epoch,
                         handshake_status,
                         now,
@@ -9660,6 +9728,7 @@ mod buffers;
 mod cid;
 mod crypto;
 mod dgram;
+mod ecn;
 mod error;
 #[cfg(feature = "ffi")]
 mod ffi;

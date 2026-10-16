@@ -56,6 +56,8 @@ pub struct CommonArgs {
     pub qpack_blocked_streams: Option<u64>,
     pub initial_rtt: Duration,
     pub initial_cwnd_packets: u64,
+    pub enable_ecn: bool,
+    pub use_ect1: bool,
 }
 
 /// Creates a new `CommonArgs` structure using the provided [`Docopt`].
@@ -82,6 +84,8 @@ pub struct CommonArgs {
 /// --qpack-max-table-capacity BYTES  Max capacity of dynamic QPACK decoding.
 /// --qpack-blocked-streams STREAMS  Limit of blocked streams while decoding.
 /// --initial-cwnd-packets      Size of initial congestion window, in packets.
+/// --enable-ecn                Enable ECN support.
+/// --use-ect1                  Use ECT(1) instead of ECT(0).
 ///
 /// [`Docopt`]: https://docs.rs/docopt/1.1.0/docopt/
 impl Args for CommonArgs {
@@ -198,6 +202,9 @@ impl Args for CommonArgs {
             .parse::<u64>()
             .unwrap();
 
+        let enable_ecn = args.get_bool("--enable-ecn");
+        let use_ect1 = args.get_bool("--use-ect1");
+
         CommonArgs {
             alpns,
             max_data,
@@ -222,6 +229,8 @@ impl Args for CommonArgs {
             qpack_blocked_streams,
             initial_rtt,
             initial_cwnd_packets,
+            enable_ecn,
+            use_ect1,
         }
     }
 }
@@ -252,6 +261,8 @@ impl Default for CommonArgs {
             qpack_blocked_streams: None,
             initial_rtt: Duration::from_millis(333),
             initial_cwnd_packets: 10,
+            enable_ecn: false,
+            use_ect1: false,
         }
     }
 }
@@ -299,6 +310,8 @@ Options:
   --source-port PORT       Source port to use when connecting to the server [default: 0].
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS   The initial congestion window size in terms of packet count [default: 10].
+  --enable-ecn                     Enable ECN support.
+  --use-ect1                       Use ECT(1) instead of ECT(0).
   -h --help                Show this screen.
 ";
 
@@ -475,6 +488,8 @@ Options:
   --disable-pacing            Disable pacing (linux only).
   --initial-rtt MILLIS     The initial RTT in milliseconds [default: 333].
   --initial-cwnd-packets PACKETS      The initial congestion window size in terms of packet count [default: 10].
+  --enable-ecn                        Enable ECN support.
+  --use-ect1                          Use ECT(1) instead of ECT(0).
   -h --help                   Show this screen.
 ";
 

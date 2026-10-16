@@ -856,6 +856,7 @@ impl From<&RecvInfo<'_>> for crate::RecvInfo {
         crate::RecvInfo {
             from: std_addr_from_c(info.from, info.from_len),
             to: std_addr_from_c(info.to, info.to_len),
+            ecn: info.ecn,
         }
     }
 }
@@ -885,6 +886,8 @@ pub struct SendInfo {
     to_len: socklen_t,
 
     at: timespec,
+
+    ecn: u8,
 }
 
 #[no_mangle]
@@ -903,6 +906,8 @@ pub extern "C" fn quiche_conn_send(
             out_info.to_len = std_addr_to_c(&info.to, &mut out_info.to);
 
             std_time_to_c(&info.at, &mut out_info.at);
+
+            out_info.ecn = info.ecn;
 
             v as ssize_t
         },

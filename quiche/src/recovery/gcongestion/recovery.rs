@@ -810,8 +810,9 @@ impl RecoveryOps for GRecovery {
     // `peer_sent_ack_ranges` should not be used without validation.
     fn on_ack_received(
         &mut self, peer_sent_ack_ranges: &RangeSet, ack_delay: u64,
-        epoch: packet::Epoch, handshake_status: HandshakeStatus, now: Instant,
-        skip_pn: Option<u64>, trace_id: &str,
+        _ecn_counts: Option<packet::EcnCounts>, epoch: packet::Epoch,
+        handshake_status: HandshakeStatus, now: Instant, skip_pn: Option<u64>,
+        trace_id: &str,
     ) -> Result<OnAckReceivedOutcome> {
         let prior_in_flight = self.bytes_in_flight.get();
 
@@ -1175,6 +1176,24 @@ impl RecoveryOps for GRecovery {
 
     fn get_next_release_time(&self) -> ReleaseDecision {
         self.pacer.get_next_release_time()
+    }
+
+    // ECN (PR #1351) is only wired into the legacy (CUBIC/Reno) recovery.
+    fn ecn_value_to_send(&mut self) -> u8 {
+        0
+    }
+
+    fn is_next_sent_pkt_ecn_marked(&self) -> bool {
+        false
+    }
+
+    fn ecn_counts(&self) -> [packet::EcnCounts; packet::Epoch::count()] {
+        Default::default()
+    }
+
+    fn ecn_reset(
+        &mut self, _base_ecn_counts: [packet::EcnCounts; packet::Epoch::count()],
+    ) {
     }
 
     fn gcongestion_enabled(&self) -> bool {

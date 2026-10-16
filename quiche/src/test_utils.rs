@@ -371,6 +371,7 @@ impl<F: BufFactory> Pipe<F> {
         let info = RecvInfo {
             to: server_path.peer_addr(),
             from: server_path.local_addr(),
+            ecn: 0,
         };
 
         self.client.recv(buf, info)
@@ -381,6 +382,7 @@ impl<F: BufFactory> Pipe<F> {
         let info = RecvInfo {
             to: client_path.peer_addr(),
             from: client_path.local_addr(),
+            ecn: 0,
         };
 
         self.server.recv(buf, info)
@@ -432,6 +434,7 @@ pub fn recv_send<F: BufFactory>(
     let info = RecvInfo {
         to: active_path.local_addr(),
         from: active_path.peer_addr(),
+        ecn: 0,
     };
 
     conn.recv(&mut buf[..len], info)?;
@@ -456,6 +459,7 @@ pub fn process_flight<F: BufFactory>(
         let info = RecvInfo {
             to: si.to,
             from: si.from,
+            ecn: 0,
         };
 
         conn.recv(&mut pkt, info)?;
@@ -651,6 +655,7 @@ pub fn helper_packet_sent(pkt_num: u64, now: Instant, size: usize) -> Sent {
         lost: 0,
         has_data: true,
         is_pmtud_probe: false,
+        ecn_marked: false,
     }
 }
 
@@ -695,6 +700,7 @@ pub fn trigger_ack_based_loss<F: BufFactory>(
         let info = RecvInfo {
             to: receiver.paths.get_active().unwrap().local_addr(),
             from: receiver.paths.get_active().unwrap().peer_addr(),
+            ecn: 0,
         };
         receiver.recv(&mut buf[..len], info).unwrap();
     }
@@ -706,6 +712,7 @@ pub fn trigger_ack_based_loss<F: BufFactory>(
     let info = RecvInfo {
         to: sender.paths.get_active().unwrap().local_addr(),
         from: sender.paths.get_active().unwrap().peer_addr(),
+        ecn: 0,
     };
     sender.recv(&mut buf[..ack_len], info).unwrap();
 }

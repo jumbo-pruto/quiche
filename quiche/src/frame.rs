@@ -46,13 +46,6 @@ pub const MAX_CRYPTO_OVERHEAD: usize = 8;
 pub const MAX_DGRAM_OVERHEAD: usize = 2;
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EcnCounts {
-    ect0_count: u64,
-    ect1_count: u64,
-    ecn_ce_count: u64,
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub enum Frame {
     Padding {
@@ -71,7 +64,7 @@ pub enum Frame {
     ACK {
         ack_delay: u64,
         ranges: ranges::RangeSet,
-        ecn_counts: Option<EcnCounts>,
+        ecn_counts: Option<packet::EcnCounts>,
     },
 
     ResetStream {
@@ -1293,7 +1286,7 @@ fn parse_ack_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     }
 
     let ecn_counts = if first & 0x01 != 0 {
-        let ecn = EcnCounts {
+        let ecn = packet::EcnCounts {
             ect0_count: b.get_varint()?,
             ect1_count: b.get_varint()?,
             ecn_ce_count: b.get_varint()?,
@@ -1513,7 +1506,7 @@ mod tests {
         ranges.insert(15..19);
         ranges.insert(3000..5000);
 
-        let ecn_counts = Some(EcnCounts {
+        let ecn_counts = Some(packet::EcnCounts {
             ect0_count: 100,
             ect1_count: 200,
             ecn_ce_count: 300,
