@@ -4684,8 +4684,28 @@ impl<F: BufFactory> Connection<F> {
         // `usize::MAX` bypasses cwnd when authorized by packet selection;
         // `left` still bounds the packet. Keep this local so other cwnd users
         // see the actual window.
+        // EXPERIMENT KNOB QUICHE_FULL_PKT (testbed only), packet sizing:
+        //   unset/0 = stock: shrink the packet to the free window
+        //   1 = picoquic: full-size packet whenever any window is free
+        //       (overshoots cwnd by < 1 packet; not RFC 9002 sec 7 MUST)
+        //   2 = wait: no ack-eliciting data until a full packet fits
+        //       (never exceeds cwnd -> RFC-compliant, no tiny packets)
+        static FULL_PKT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let full_pkt = *FULL_PKT.get_or_init(|| {
+            let v = std::env::var("QUICHE_FULL_PKT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0u8);
+            eprintln!("KNOBS full_pkt={v}");
+            v
+        });
+        let avail = path.recovery.cwnd_available();
         let send_limit_from_cwnd = if bypass_cwnd {
             usize::MAX
+        } else if full_pkt == 1 && avail > 0 {
+            usize::MAX
+        } else if full_pkt == 2 && avail < left + overhead {
+            0
         } else {
             path.recovery.cwnd_available()
         }

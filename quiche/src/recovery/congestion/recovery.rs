@@ -560,6 +560,19 @@ impl LegacyRecovery {
         );
 
         if let Some(pkt) = loss.largest_lost_pkt {
+            let dbg_new_event =
+                !self.congestion.in_congestion_recovery(pkt.time_sent);
+            eprintln!(
+                "LOSSDBG epoch={:.6} lost_pkts={} new_event={} cwnd={}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0),
+                loss.lost_packets,
+                dbg_new_event,
+                self.congestion.congestion_window /
+                    self.congestion.max_datagram_size
+            );
             if !self.congestion.in_congestion_recovery(pkt.time_sent) {
                 (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
             }
@@ -800,6 +813,17 @@ impl RecoveryOps for LegacyRecovery {
             return;
         };
 
+        let dbg_new_event = !self.congestion.in_congestion_recovery(time_sent);
+        eprintln!(
+            "ECNDBG epoch={:.6} ce_increase=1 new_event={} cwnd={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+            dbg_new_event,
+            self.congestion.congestion_window / self.congestion.max_datagram_size
+        );
+
         if !self.congestion.in_congestion_recovery(time_sent) {
             (self.congestion.cc_ops.checkpoint)(&mut self.congestion);
         }
@@ -943,9 +967,23 @@ impl RecoveryOps for LegacyRecovery {
     }
 
     fn cwnd_available(&self) -> usize {
-        // Open more space (snd_cnt) for PRR when allowed.
-        self.cwnd().saturating_sub(self.bytes_in_flight.get()) +
+        // EXPERIMENT KNOB QUICHE_NO_PRR=1 (testbed only): reduce the window
+        // immediately on a congestion event (RFC 9002 sec 7.3.2 allows this
+        // instead of PRR): no extra snd_cnt budget during recovery.
+        static NO_PRR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let no_prr = *NO_PRR.get_or_init(|| {
+            let v = std::env::var("QUICHE_NO_PRR").map(|v| v == "1");
+            let v = v.unwrap_or(false);
+            eprintln!("KNOBS no_prr={v}");
+            v
+        });
+        let prr = if no_prr {
+            0
+        } else {
             self.congestion.prr.snd_cnt
+        };
+        // Open more space (snd_cnt) for PRR when allowed.
+        self.cwnd().saturating_sub(self.bytes_in_flight.get()) + prr
     }
 
     fn rtt(&self) -> Duration {

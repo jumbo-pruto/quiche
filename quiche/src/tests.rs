@@ -8600,7 +8600,13 @@ fn pto_probe_not_stranded_by_earlier_epoch_data(
     // the earlier Handshake data.
     let (ty, _) = pipe
         .client
-        .send_single(&mut buf, active_pid, false, Instant::now())
+        .send_single(
+            &mut buf,
+            active_pid,
+            false,
+            Instant::now(),
+            crate::EcnCodepoint::NotEct,
+        )
         .unwrap();
     assert_eq!(ty, Type::Short);
     assert_eq!(
