@@ -38,11 +38,11 @@ use std::time::Instant;
 
 use super::rtt::RttStats;
 use super::Acked;
-use super::Sent;
 
 use super::reno;
 use super::Congestion;
 use super::CongestionControlOps;
+use super::CongestionEventCause;
 use crate::recovery::MINIMUM_WINDOW_PACKETS;
 
 pub(crate) static CUBIC: CongestionControlOps = CongestionControlOps {
@@ -100,6 +100,12 @@ pub struct State {
     // Store cwnd increment during congestion avoidance.
     cwnd_inc: usize,
 
+    // What triggered the current congestion recovery episode, if any. Used
+    // to fence the spurious-congestion rollback heuristic (below) to
+    // loss-triggered episodes only: it isn't a meaningful signal for a
+    // validated ECN CE event.
+    pub(super) last_event_cause: Option<CongestionEventCause>,
+
     // CUBIC state checkpoint preceding the last congestion event.
     prior: PriorState,
 }
@@ -120,6 +126,8 @@ struct PriorState {
     epoch_start: Option<Instant>,
 
     lost_count: usize,
+
+    last_event_cause: Option<CongestionEventCause>,
 }
 
 /// CUBIC Functions.
@@ -235,7 +243,14 @@ fn on_packet_acked(
     // If recovery ends after fewer than
     // `cwnd / mss * ROLLBACK_THRESHOLD_PERCENT` packets, treat the congestion
     // event as spurious and restore the previous state.
-    if r.congestion_recovery_start_time.is_some() {
+    //
+    // This heuristic only applies to loss-triggered episodes: a validated
+    // ECN CE mark isn't a maybe-spurious loss classification, so a low
+    // subsequent loss count doesn't imply the CE-driven reduction should be
+    // undone.
+    if r.congestion_recovery_start_time.is_some() &&
+        r.cubic_state.last_event_cause == Some(CongestionEventCause::Loss)
+    {
         let new_lost = r.lost_count - r.cubic_state.prior.lost_count;
 
         let rollback_threshold = (r.congestion_window / r.max_datagram_size) *
@@ -354,17 +369,17 @@ fn on_packet_acked(
 
 fn congestion_event(
     r: &mut Congestion, bytes_in_flight: usize, _lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    time_sent: Instant, cause: CongestionEventCause, now: Instant,
 ) {
-    let time_sent = largest_lost_pkt.time_sent;
     let in_congestion_recovery = r.in_congestion_recovery(time_sent);
 
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.
     if !in_congestion_recovery {
         r.congestion_recovery_start_time = Some(now);
+        r.cubic_state.last_event_cause = Some(cause);
 
-        // Fast convergence
+        // Fast convergence.
         if (r.congestion_window as f64) < r.cubic_state.w_max {
             r.cubic_state.w_max =
                 r.congestion_window as f64 * (1.0 + BETA_CUBIC) / 2.0;
@@ -406,6 +421,7 @@ fn checkpoint(r: &mut Congestion) {
     r.cubic_state.prior.k = r.cubic_state.k;
     r.cubic_state.prior.epoch_start = r.congestion_recovery_start_time;
     r.cubic_state.prior.lost_count = r.lost_count;
+    r.cubic_state.prior.last_event_cause = r.cubic_state.last_event_cause;
 }
 
 fn rollback(r: &mut Congestion) -> bool {
@@ -423,6 +439,7 @@ fn rollback(r: &mut Congestion) -> bool {
     r.cubic_state.w_max = r.cubic_state.prior.w_max;
     r.cubic_state.k = r.cubic_state.prior.k;
     r.congestion_recovery_start_time = r.cubic_state.prior.epoch_start;
+    r.cubic_state.last_event_cause = r.cubic_state.prior.last_event_cause;
 
     true
 }
@@ -523,6 +540,48 @@ mod tests {
             cwnd_prev as f64 * BETA_CUBIC,
             sender.congestion_window as f64
         );
+    }
+
+    #[test]
+    fn ecn_event_is_not_undone_by_spurious_loss_rollback_heuristic() {
+        let mut sender = test_sender();
+        let size = sender.max_datagram_size;
+
+        for _ in 0..4 {
+            sender.send_packet(size);
+        }
+
+        let cwnd_prev = sender.congestion_window;
+        sender.ce_event(size, None);
+
+        let reduced_cwnd = sender.congestion_window;
+        assert!(reduced_cwnd < cwnd_prev);
+
+        // Ack a packet sent after the CE event, so it takes the "exit
+        // recovery" path in `on_packet_acked` that runs the spurious-loss
+        // rollback heuristic (see `cubic_spurious_congestion_event`, which
+        // shows this same shape of ack *does* roll back a loss-triggered
+        // reduction). With zero new losses since the CE event, the
+        // heuristic would want to roll back an ordinary loss reduction, but
+        // must not touch this ECN-triggered one.
+        let rtt = Duration::from_millis(100);
+        sender.update_rtt(rtt);
+
+        let acked = Acked {
+            pkt_num: 0,
+            time_sent: sender.time + rtt,
+            size,
+            delivered: 0,
+            delivered_time: sender.time,
+            first_sent_time: sender.time,
+            is_app_limited: false,
+            rtt: Duration::ZERO,
+            ecn: crate::EcnCodepoint::NotEct,
+        };
+
+        sender.inject_ack(acked, sender.time + rtt + Duration::from_millis(5));
+
+        assert_eq!(sender.congestion_window, reduced_cwnd);
     }
 
     #[test]
@@ -762,6 +821,7 @@ mod tests {
             first_sent_time: sender.time,
             is_app_limited: false,
             rtt: Duration::ZERO,
+            ecn: crate::EcnCodepoint::NotEct,
         };
 
         // Trigger detecting spurious congestion event
@@ -792,6 +852,7 @@ mod tests {
             first_sent_time: sender.time,
             is_app_limited: false,
             rtt: Duration::ZERO,
+            ecn: crate::EcnCodepoint::NotEct,
         };
 
         // Trigger detecting spurious congestion event.

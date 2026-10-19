@@ -393,6 +393,18 @@ impl<F: BufFactory> Pipe<F> {
         recv_send(&mut self.server, buf, written)
     }
 
+    /// Same as [`send_pkt_to_server()`], but delivers the packet as if its
+    /// IP header carried the given ECN codepoint.
+    ///
+    /// [`send_pkt_to_server()`]: Pipe::send_pkt_to_server
+    pub fn send_pkt_to_server_with_ecn(
+        &mut self, pkt_type: Type, frames: &[frame::Frame], buf: &mut [u8],
+        ecn: Option<EcnCodepoint>,
+    ) -> Result<usize> {
+        let written = encode_pkt(&mut self.client, pkt_type, frames, buf)?;
+        recv_send_with_ecn(&mut self.server, buf, written, ecn)
+    }
+
     pub fn client_update_key(&mut self) -> Result<()> {
         let crypto_ctx = &mut self.client.crypto_ctx[packet::Epoch::Application];
 
@@ -435,6 +447,33 @@ pub fn recv_send<F: BufFactory>(
     };
 
     conn.recv(&mut buf[..len], info)?;
+
+    let mut off = 0;
+
+    match conn.send(&mut buf[off..]) {
+        Ok((write, _)) => off += write,
+
+        Err(Error::Done) => (),
+
+        Err(e) => return Err(e),
+    }
+
+    Ok(off)
+}
+
+/// Same as [`recv_send()`], but delivers the packet as if its IP header
+/// carried the given ECN codepoint.
+pub fn recv_send_with_ecn<F: BufFactory>(
+    conn: &mut Connection<F>, buf: &mut [u8], len: usize,
+    ecn: Option<EcnCodepoint>,
+) -> Result<usize> {
+    let active_path = conn.paths.get_active()?;
+    let info = RecvInfo {
+        to: active_path.local_addr(),
+        from: active_path.peer_addr(),
+    };
+
+    conn.recv_with_ecn(&mut buf[..len], info, ecn)?;
 
     let mut off = 0;
 
@@ -651,6 +690,7 @@ pub fn helper_packet_sent(pkt_num: u64, now: Instant, size: usize) -> Sent {
         lost: 0,
         has_data: true,
         is_pmtud_probe: false,
+        ecn: EcnCodepoint::NotEct,
     }
 }
 

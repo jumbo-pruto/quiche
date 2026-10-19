@@ -33,6 +33,7 @@ use crate::packet;
 use crate::ranges::RangeSet;
 pub(crate) use crate::recovery::bandwidth::Bandwidth;
 use crate::Config;
+use crate::EcnCodepoint;
 use crate::Result;
 
 #[cfg(feature = "qlog")]
@@ -220,6 +221,14 @@ pub trait RecoveryOps {
         handshake_status: HandshakeStatus, now: Instant, skip_pn: Option<u64>,
         trace_id: &str,
     ) -> Result<OnAckReceivedOutcome>;
+
+    /// Number of packets newly acknowledged by the most recently processed
+    /// ACK frame that this endpoint had sent with the ECT(0) codepoint.
+    fn newly_acked_ect0(&self) -> u64;
+
+    /// Applies a congestion response to a validated ECN CE mark reported by
+    /// the most recently processed ACK frame.
+    fn on_ecn_ce_event(&mut self, now: Instant);
 
     fn on_loss_detection_timeout(
         &mut self, handshake_status: HandshakeStatus, now: Instant,
@@ -432,6 +441,10 @@ pub struct Sent {
     pub has_data: bool,
 
     pub is_pmtud_probe: bool,
+
+    /// The ECN codepoint this endpoint marked this packet with when it was
+    /// sent.
+    pub ecn: EcnCodepoint,
 }
 
 impl std::fmt::Debug for Sent {
@@ -446,7 +459,8 @@ impl std::fmt::Debug for Sent {
         write!(f, "tx_in_flight={} ", self.tx_in_flight)?;
         write!(f, "lost={} ", self.lost)?;
         write!(f, "has_data={} ", self.has_data)?;
-        write!(f, "is_pmtud_probe={}", self.is_pmtud_probe)?;
+        write!(f, "is_pmtud_probe={} ", self.is_pmtud_probe)?;
+        write!(f, "ecn={:?}", self.ecn)?;
 
         Ok(())
     }
@@ -984,6 +998,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1015,6 +1030,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1046,6 +1062,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1076,6 +1093,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1146,6 +1164,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1176,6 +1195,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1270,6 +1290,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1300,6 +1321,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1330,6 +1352,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1360,6 +1383,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -1963,6 +1987,7 @@ mod tests {
                 lost: 0,
                 has_data: true,
                 is_pmtud_probe: false,
+                ecn: EcnCodepoint::NotEct,
             };
 
             r.on_packet_sent(
@@ -2041,6 +2066,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -2081,6 +2107,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -2113,6 +2140,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -2492,6 +2520,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -2524,6 +2553,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: true,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -2553,6 +2583,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(
@@ -2873,6 +2904,7 @@ mod tests {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
         r.on_packet_sent(
             p_initial,
@@ -2904,6 +2936,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
         r.on_packet_sent(
             p_app,
@@ -2972,6 +3005,7 @@ mod tests {
             lost: 0,
             has_data: true,
             is_pmtud_probe: false,
+            ecn: EcnCodepoint::NotEct,
         };
 
         r.on_packet_sent(

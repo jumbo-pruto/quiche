@@ -48,9 +48,23 @@ pub const MAX_STREAM_SIZE: u64 = 1 << 62;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcnCounts {
-    ect0_count: u64,
-    ect1_count: u64,
-    ecn_ce_count: u64,
+    pub(crate) ect0_count: u64,
+    pub(crate) ect1_count: u64,
+    pub(crate) ecn_ce_count: u64,
+}
+
+impl EcnCounts {
+    /// Creates a new set of cumulative ECN counts, as reported in an ACK
+    /// frame's ECN section (see RFC 9000 Section 19.3.2).
+    pub(crate) fn new(
+        ect0_count: u64, ect1_count: u64, ecn_ce_count: u64,
+    ) -> Self {
+        EcnCounts {
+            ect0_count,
+            ect1_count,
+            ecn_ce_count,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]

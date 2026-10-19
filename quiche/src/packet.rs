@@ -32,11 +32,13 @@ use std::ops::RangeInclusive;
 
 use std::time::Instant;
 
+use crate::EcnCodepoint;
 use crate::Error;
 use crate::Result;
 use crate::DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS;
 
 use crate::crypto;
+use crate::frame;
 use crate::rand;
 use crate::ranges;
 use crate::recovery;
@@ -882,6 +884,23 @@ pub struct PktNumSpace {
 
     /// Track if a received packet is ack eliciting.
     pub ack_elicited: bool,
+
+    /// Cumulative count of accepted packets received with the ECT(0)
+    /// codepoint, per RFC 9000 Section 13.4.1.
+    ecn_ect0_count: u64,
+
+    /// Cumulative count of accepted packets received with the ECT(1)
+    /// codepoint, per RFC 9000 Section 13.4.1.
+    ecn_ect1_count: u64,
+
+    /// Cumulative count of accepted packets received with the CE
+    /// codepoint, per RFC 9000 Section 13.4.1.
+    ecn_ce_count: u64,
+
+    /// Whether this endpoint has had access to ECN metadata for at least
+    /// one accepted packet in this space, and therefore reports ECN
+    /// counts in ACK frames (RFC 9000 Section 13.4.1).
+    ecn_capable: bool,
 }
 
 impl PktNumSpace {
@@ -894,6 +913,10 @@ impl PktNumSpace {
             recv_pkt_need_ack: ranges::RangeSet::new(crate::MAX_ACK_RANGES),
             recv_pkt_num: PktNumWindow::default(),
             ack_elicited: false,
+            ecn_ect0_count: 0,
+            ecn_ect1_count: 0,
+            ecn_ce_count: 0,
+            ecn_capable: false,
         }
     }
 
@@ -909,6 +932,51 @@ impl PktNumSpace {
         // Track the largest packet number sent
         self.largest_tx_pkt_num =
             self.largest_tx_pkt_num.max(Some(sent_pkt.pkt_num));
+    }
+
+    /// Records the ECN codepoint observed for a newly accepted packet in
+    /// this packet number space, per RFC 9000 Section 13.4.1.
+    ///
+    /// `ecn` must be `None` when the codepoint could not be determined for
+    /// this packet (for example, because the platform or socket API does
+    /// not support reading it). Once this endpoint has observed ECN
+    /// metadata for this space, it reports cumulative ECN counts in
+    /// outgoing ACK frames for the remainder of the space's lifetime, even
+    /// if all counts are zero.
+    pub fn record_ecn(&mut self, ecn: Option<EcnCodepoint>) {
+        match ecn {
+            Some(EcnCodepoint::NotEct) => self.ecn_capable = true,
+
+            Some(EcnCodepoint::Ect0) => {
+                self.ecn_capable = true;
+                self.ecn_ect0_count += 1;
+            },
+
+            Some(EcnCodepoint::Ect1) => {
+                self.ecn_capable = true;
+                self.ecn_ect1_count += 1;
+            },
+
+            Some(EcnCodepoint::Ce) => {
+                self.ecn_capable = true;
+                self.ecn_ce_count += 1;
+            },
+
+            None => (),
+        }
+    }
+
+    /// Returns the cumulative ECN counts to report in an ACK frame, or
+    /// `None` if this endpoint has never had access to ECN metadata for
+    /// this packet number space.
+    pub fn ecn_counts(&self) -> Option<frame::EcnCounts> {
+        self.ecn_capable.then(|| {
+            frame::EcnCounts::new(
+                self.ecn_ect0_count,
+                self.ecn_ect1_count,
+                self.ecn_ce_count,
+            )
+        })
     }
 }
 

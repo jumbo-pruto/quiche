@@ -86,6 +86,7 @@ impl TestSender {
             lost: 0,
             has_data: false,
             is_pmtud_probe: false,
+            ecn: crate::EcnCodepoint::NotEct,
         };
 
         self.cc.on_packet_sent(
@@ -130,6 +131,7 @@ impl TestSender {
                 delivered_time: unacked.delivered_time,
                 first_sent_time: unacked.first_sent_time,
                 is_app_limited: unacked.is_app_limited,
+                ecn: unacked.ecn,
             });
 
             self.next_ack += 1;
@@ -168,12 +170,40 @@ impl TestSender {
             &mut self.cc,
             self.bytes_in_flight,
             n * bytes,
-            &unacked,
+            unacked.time_sent,
+            super::CongestionEventCause::Loss,
             self.time,
         );
 
         self.cc.lost_count += n;
         self.bytes_in_flight -= n * bytes;
+    }
+
+    /// Directly triggers a validated-ECN-CE-mark congestion event, as if a
+    /// newly acknowledged packet sent at `time_sent` (or the next unacked
+    /// packet's real send time, if `None`) had been reported CE-marked.
+    pub(crate) fn ce_event(&mut self, bytes: usize, time_sent: Option<Instant>) {
+        let mut unacked = self.sent_packets.pop_front().unwrap();
+        self.next_ack += 1;
+
+        if let Some(time) = time_sent {
+            unacked.time_sent = time;
+        }
+
+        if !self.cc.in_congestion_recovery(unacked.time_sent) {
+            (self.cc.cc_ops.checkpoint)(&mut self.cc);
+        }
+
+        (self.cc_ops.congestion_event)(
+            &mut self.cc,
+            self.bytes_in_flight,
+            0,
+            unacked.time_sent,
+            super::CongestionEventCause::Ecn,
+            self.time,
+        );
+
+        self.bytes_in_flight -= bytes;
     }
 
     pub(crate) fn update_rtt(&mut self, rtt: Duration) {
