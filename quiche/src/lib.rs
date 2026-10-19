@@ -4231,6 +4231,7 @@ impl<F: BufFactory> Connection<F> {
                     send_pid,
                     has_initial,
                     now,
+                    ecn,
                     Type::from_epoch(epoch),
                     true,
                 ) {
@@ -4252,6 +4253,7 @@ impl<F: BufFactory> Connection<F> {
             send_pid,
             has_initial,
             now,
+            ecn,
             pkt_type,
             bypass_cwnd,
         )
@@ -4259,7 +4261,7 @@ impl<F: BufFactory> Connection<F> {
 
     fn send_single_for_type(
         &mut self, out: &mut [u8], send_pid: usize, has_initial: bool,
-        now: Instant, pkt_type: Type, bypass_cwnd: bool,
+        now: Instant, ecn: EcnCodepoint, pkt_type: Type, bypass_cwnd: bool,
     ) -> Result<(Type, usize)> {
         let is_closing = self.local_error.is_some();
 
