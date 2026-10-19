@@ -33,6 +33,7 @@
 //! by a PTO-based time budget), and there is no automatic re-probing after a
 //! path enters the `Failed` state.
 
+use crate::packet::Epoch;
 use crate::EcnCodepoint;
 
 /// Maximum number of packets to mark while probing a path for ECN support,
@@ -70,12 +71,13 @@ pub(crate) struct EcnSender {
     sent_ect0: u64,
 
     /// Peer-reported cumulative ECT(0) count as of the last packet for which
-    /// validation was attempted.
-    acked_ect0: u64,
+    /// validation was attempted. Kept per packet number space: ECN counts
+    /// are maintained separately for each space (RFC 9000 Section 13.4.1).
+    acked_ect0: [u64; Epoch::count()],
 
     /// Peer-reported cumulative CE count as of the last packet for which
-    /// validation was attempted.
-    acked_ce: u64,
+    /// validation was attempted, per packet number space.
+    acked_ce: [u64; Epoch::count()],
 }
 
 impl EcnSender {
@@ -84,8 +86,8 @@ impl EcnSender {
             state: State::Testing,
             testing_sent: 0,
             sent_ect0: 0,
-            acked_ect0: 0,
-            acked_ce: 0,
+            acked_ect0: [0; Epoch::count()],
+            acked_ce: [0; Epoch::count()],
         }
     }
 
@@ -147,7 +149,8 @@ impl EcnSender {
     /// genuine new CE mark to respond to; it is `false` for a purely
     /// ECT(0)-evidenced validation, a no-op call, or a failure.
     pub(crate) fn validate(
-        &mut self, peer_counts: Option<(u64, u64)>, newly_acked_ect0: u64,
+        &mut self, epoch: Epoch, peer_counts: Option<(u64, u64)>,
+        newly_acked_ect0: u64,
     ) -> bool {
         if self.state == State::Failed || newly_acked_ect0 == 0 {
             return false;
@@ -163,15 +166,15 @@ impl EcnSender {
         // Reported counts must not exceed what was actually sent, and must
         // not have decreased since the last validated ACK.
         if peer_ect0 > self.sent_ect0 ||
-            peer_ect0 < self.acked_ect0 ||
-            peer_ce < self.acked_ce
+            peer_ect0 < self.acked_ect0[epoch] ||
+            peer_ce < self.acked_ce[epoch]
         {
             self.state = State::Failed;
             return false;
         }
 
-        let delta_ect0 = peer_ect0 - self.acked_ect0;
-        let delta_ce = peer_ce - self.acked_ce;
+        let delta_ect0 = peer_ect0 - self.acked_ect0[epoch];
+        let delta_ce = peer_ce - self.acked_ce[epoch];
 
         // The combined increase in ECT(0) and CE counts must cover every
         // newly acknowledged marked packet.
@@ -180,14 +183,22 @@ impl EcnSender {
             return false;
         }
 
-        self.acked_ect0 = peer_ect0;
-        self.acked_ce = peer_ce;
+        self.acked_ect0[epoch] = peer_ect0;
+        self.acked_ce[epoch] = peer_ce;
 
         if matches!(self.state, State::Testing | State::Unknown) {
             self.state = State::Capable;
         }
 
         delta_ce > 0
+    }
+
+    /// State name and counters, for the testbed's ECNSTATE log line.
+    pub(crate) fn dbg_state(&self) -> String {
+        format!(
+            "{:?}(sent={} acked_ect0={:?} acked_ce={:?})",
+            self.state, self.sent_ect0, self.acked_ect0, self.acked_ce
+        )
     }
 
     #[cfg(test)]
@@ -235,7 +246,7 @@ mod tests {
 
         assert_eq!(sender.next_codepoint(), EcnCodepoint::Ect0);
 
-        assert!(!sender.validate(Some((1, 0)), 1));
+        assert!(!sender.validate(Epoch::Application, Some((1, 0)), 1));
 
         assert!(sender.is_capable());
         assert_eq!(sender.next_codepoint(), EcnCodepoint::Ect0);
@@ -250,7 +261,7 @@ mod tests {
         // The single marked packet was reported back as CE, not ECT(0); this
         // still counts as valid evidence that the path carries ECN, and
         // warrants a congestion response.
-        assert!(sender.validate(Some((0, 1)), 1));
+        assert!(sender.validate(Epoch::Application, Some((0, 1)), 1));
 
         assert!(sender.is_capable());
     }
@@ -261,7 +272,7 @@ mod tests {
 
         assert_eq!(sender.next_codepoint(), EcnCodepoint::Ect0);
 
-        assert!(!sender.validate(None, 1));
+        assert!(!sender.validate(Epoch::Application, None, 1));
 
         assert!(sender.is_failed());
         assert_eq!(sender.next_codepoint(), EcnCodepoint::NotEct);
@@ -275,7 +286,7 @@ mod tests {
 
         // Reported counts never increase, even though a marked packet was
         // newly acknowledged: the marking was stripped in the network.
-        assert!(!sender.validate(Some((0, 0)), 1));
+        assert!(!sender.validate(Epoch::Application, Some((0, 0)), 1));
 
         assert!(sender.is_failed());
     }
@@ -288,7 +299,7 @@ mod tests {
 
         // Only one ECT(0) packet was ever sent, so a reported count of 5 is
         // impossible and indicates remarking in the network.
-        assert!(!sender.validate(Some((5, 0)), 1));
+        assert!(!sender.validate(Epoch::Application, Some((5, 0)), 1));
 
         assert!(sender.is_failed());
     }
@@ -299,13 +310,13 @@ mod tests {
 
         sender.next_codepoint();
         sender.next_codepoint();
-        assert!(!sender.validate(Some((2, 0)), 2));
+        assert!(!sender.validate(Epoch::Application, Some((2, 0)), 2));
         assert!(sender.is_capable());
 
         sender.next_codepoint();
         // A later ACK reports fewer ECT(0) packets than were already
         // validated; this is treated as inconsistent feedback.
-        assert!(!sender.validate(Some((1, 0)), 1));
+        assert!(!sender.validate(Epoch::Application, Some((1, 0)), 1));
 
         assert!(sender.is_failed());
     }
@@ -315,7 +326,7 @@ mod tests {
         let mut sender = EcnSender::new();
 
         // No packets have been sent yet, so there is nothing to validate.
-        assert!(!sender.validate(Some((0, 0)), 0));
+        assert!(!sender.validate(Epoch::Application, Some((0, 0)), 0));
 
         assert!(sender.is_testing());
     }
@@ -325,13 +336,13 @@ mod tests {
         let mut sender = EcnSender::new();
 
         sender.next_codepoint();
-        assert!(!sender.validate(Some((1, 0)), 1));
+        assert!(!sender.validate(Epoch::Application, Some((1, 0)), 1));
         assert!(sender.is_capable());
 
         sender.next_codepoint();
         // A later CE mark on an already-validated path still warrants a
         // congestion response.
-        assert!(sender.validate(Some((1, 1)), 1));
+        assert!(sender.validate(Epoch::Application, Some((1, 1)), 1));
         assert!(sender.is_capable());
     }
 
@@ -340,12 +351,29 @@ mod tests {
         let mut sender = EcnSender::new();
 
         sender.next_codepoint();
-        assert!(!sender.validate(None, 1));
+        assert!(!sender.validate(Epoch::Application, None, 1));
         assert!(sender.is_failed());
 
         // Even conclusive-looking evidence afterwards does not reopen
         // validation; there is no automatic retry in this implementation.
-        assert!(!sender.validate(Some((100, 100)), 1));
+        assert!(!sender.validate(Epoch::Application, Some((100, 100)), 1));
         assert!(sender.is_failed());
+    }
+
+    #[test]
+    fn counts_are_tracked_per_packet_number_space() {
+        let mut sender = EcnSender::new();
+        for _ in 0..4 {
+            sender.next_codepoint();
+        }
+
+        // Initial space: 2 ECT(0) packets acknowledged, counts (2, 0).
+        assert!(!sender.validate(Epoch::Initial, Some((2, 0)), 2));
+        assert!(sender.is_capable());
+
+        // The Application space starts counting from zero: (1, 0) is not a
+        // decrease and must not fail validation.
+        assert!(!sender.validate(Epoch::Application, Some((1, 0)), 1));
+        assert!(sender.is_capable());
     }
 }

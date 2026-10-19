@@ -8602,10 +8602,25 @@ impl<F: BufFactory> Connection<F> {
                     )?;
 
                     if let Some(ecn_sender) = self.ecn_sender.as_mut() {
+                        let dbg_before = ecn_sender.dbg_state();
                         let ce_event = ecn_sender.validate(
+                            epoch,
                             peer_ecn_counts,
                             p.recovery.newly_acked_ect0(),
                         );
+                        if p.recovery.newly_acked_ect0() > 0 ||
+                            dbg_before != ecn_sender.dbg_state()
+                        {
+                            eprintln!(
+                                "ECNSTATE epoch={:?} acked_ect0={} counts={:?} {} -> {} ce_event={}",
+                                epoch,
+                                p.recovery.newly_acked_ect0(),
+                                peer_ecn_counts,
+                                dbg_before,
+                                ecn_sender.dbg_state(),
+                                ce_event
+                            );
+                        }
 
                         if ce_event {
                             p.recovery.on_ecn_ce_event(now);
