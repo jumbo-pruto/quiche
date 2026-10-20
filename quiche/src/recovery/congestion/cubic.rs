@@ -74,6 +74,58 @@ const MIN_ROLLBACK_THRESHOLD: usize = 2;
 /// Default value of alpha_aimd in the beginning of congestion avoidance.
 const ALPHA_AIMD: f64 = 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC);
 
+// EXPERIMENT KNOBS (testbed only, never commit). Read once from the env;
+// all unset = stock quiche behaviour.
+//   CUBIC_BETA=<f64>        multiplicative decrease (default 0.7)
+//   CUBIC_NO_ROLLBACK=1     disable the 20%-of-cwnd spurious-loss rollback
+//   CUBIC_WEST_HALF=1       after a cut, restart W_est at old_cwnd/2
+//                           (picoquic: W_reno = cwin/2) instead of new cwnd
+//   CUBIC_LOSS_FILTER=1     picoquic smoothed-loss filter: only start a new
+//                           congestion event once the EWMA drop rate over
+//                           packet numbers (factor 1/16) exceeds 0.15
+struct Knobs {
+    beta: f64,
+    no_rollback: bool,
+    west_half: bool,
+    loss_filter: bool,
+    pico_fc: bool,
+    no_fc: bool,
+    srtt: bool,
+}
+
+fn knobs() -> &'static Knobs {
+    static K: std::sync::OnceLock<Knobs> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let on = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
+        let k = Knobs {
+            beta: std::env::var("CUBIC_BETA")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(BETA_CUBIC),
+            no_rollback: on("CUBIC_NO_ROLLBACK"),
+            west_half: on("CUBIC_WEST_HALF"),
+            loss_filter: on("CUBIC_LOSS_FILTER"),
+            pico_fc: on("CUBIC_PICO_FC"),
+            no_fc: on("CUBIC_NO_FC"),
+            srtt: on("CUBIC_SRTT"),
+        };
+        eprintln!(
+            "KNOBS beta={} no_rollback={} west_half={} loss_filter={} pico_fc={} no_fc={} srtt={}",
+            k.beta, k.no_rollback, k.west_half, k.loss_filter, k.pico_fc,
+            k.no_fc, k.srtt
+        );
+        k
+    })
+}
+
+fn beta() -> f64 {
+    knobs().beta
+}
+
+fn alpha_aimd() -> f64 {
+    3.0 * (1.0 - beta()) / (1.0 + beta())
+}
+
 /// CUBIC State Variables.
 ///
 /// We need to keep those variables across the connection.
@@ -99,6 +151,13 @@ pub struct State {
 
     // Store cwnd increment during congestion avoidance.
     cwnd_inc: usize,
+
+    // CUBIC_LOSS_FILTER state (picoquic cc_common.c hystart_loss_test).
+    smoothed_drop_rate: f64,
+    last_lost_pn: u64,
+
+    // CUBIC_PICO_FC state (picoquic W_last_max).
+    w_last_max: f64,
 
     // CUBIC state checkpoint preceding the last congestion event.
     prior: PriorState,
@@ -244,9 +303,18 @@ fn on_packet_acked(
 
         let rollback_threshold = rollback_threshold.max(MIN_ROLLBACK_THRESHOLD);
 
-        if new_lost < rollback_threshold {
+        if !knobs().no_rollback && new_lost < rollback_threshold {
+            let dbg_from = r.congestion_window / r.max_datagram_size;
             let did_rollback = rollback(r);
             if did_rollback {
+                eprintln!(
+                    "ROLLBACKDBG epoch={:.6} cwnd_from={} cwnd_to={} new_lost={} thresh={}",
+                    dbg_epoch(),
+                    dbg_from,
+                    r.congestion_window / r.max_datagram_size,
+                    new_lost,
+                    rollback_threshold
+                );
                 return;
             }
         }
@@ -286,7 +354,7 @@ fn on_packet_acked(
                 r.cubic_state.k = 0.0;
 
                 r.cubic_state.w_est = r.congestion_window as f64;
-                r.cubic_state.alpha_aimd = ALPHA_AIMD;
+                r.cubic_state.alpha_aimd = alpha_aimd();
             }
         } else {
             match r.congestion_recovery_start_time {
@@ -301,7 +369,7 @@ fn on_packet_acked(
                     r.cubic_state.k = 0.0;
 
                     r.cubic_state.w_est = r.congestion_window as f64;
-                    r.cubic_state.alpha_aimd = ALPHA_AIMD;
+                    r.cubic_state.alpha_aimd = alpha_aimd();
                 },
             }
         }
@@ -309,9 +377,14 @@ fn on_packet_acked(
         let t = now.saturating_duration_since(ca_start_time);
 
         // target = w_cubic(t + rtt)
-        let target = r
-            .cubic_state
-            .w_cubic(t + *rtt_stats.min_rtt, r.max_datagram_size);
+        // CUBIC_SRTT=1: RFC 9438 sec 4.2 uses the smoothed RTT here; quiche
+        // stock uses min_rtt.
+        let lookahead = if knobs().srtt {
+            rtt_stats.smoothed_rtt
+        } else {
+            *rtt_stats.min_rtt
+        };
+        let target = r.cubic_state.w_cubic(t + lookahead, r.max_datagram_size);
 
         // Clipping target to [cwnd, 1.5 x cwnd]
         let target = f64::max(target, r.congestion_window as f64);
@@ -331,6 +404,9 @@ fn on_packet_acked(
 
         let mut cubic_cwnd = r.congestion_window;
 
+        let dbg_wcubic = r.cubic_state.w_cubic(t, r.max_datagram_size);
+        let dbg_aimd = dbg_wcubic < r.cubic_state.w_est;
+
         if r.cubic_state.w_cubic(t, r.max_datagram_size) < r.cubic_state.w_est {
             // AIMD friendly region (W_cubic(t) < W_est)
             cubic_cwnd = cmp::max(cubic_cwnd, r.cubic_state.w_est as usize);
@@ -348,31 +424,109 @@ fn on_packet_acked(
         if r.cubic_state.cwnd_inc >= r.max_datagram_size {
             r.congestion_window += r.max_datagram_size;
             r.cubic_state.cwnd_inc -= r.max_datagram_size;
+            let mds = r.max_datagram_size as f64;
+            eprintln!(
+                "CUBICDBG t={:.3} cwnd={} wcubic={:.1} west={:.1} wmax={:.1} target={:.1} region={}",
+                t.as_secs_f64(),
+                r.congestion_window / r.max_datagram_size,
+                dbg_wcubic / mds,
+                r.cubic_state.w_est / mds,
+                r.cubic_state.w_max / mds,
+                target / mds,
+                if dbg_aimd { "AIMD" } else { "CUBIC" }
+            );
         }
     }
 }
 
+// picoquic cc_common.c picoquic_cc_hystart_loss_test(), verbatim logic:
+// EWMA of drops over packet numbers; true once the rate exceeds 0.15.
+fn loss_filter_update(s: &mut State, lost_pn: u64) -> bool {
+    const SCOPE: u64 = 32;
+    const FACTOR: f64 = 1.0 / 16.0;
+    const THRESH: f64 = 0.15;
+
+    let mut next = s.last_lost_pn;
+    if lost_pn <= next {
+        return false;
+    }
+    if next + SCOPE < lost_pn {
+        next = lost_pn - SCOPE;
+    }
+    while next < lost_pn {
+        s.smoothed_drop_rate *= 1.0 - FACTOR;
+        next += 1;
+    }
+    s.smoothed_drop_rate += (1.0 - s.smoothed_drop_rate) * FACTOR;
+    s.last_lost_pn = lost_pn;
+    s.smoothed_drop_rate > THRESH
+}
+
 fn congestion_event(
-    r: &mut Congestion, bytes_in_flight: usize, _lost_bytes: usize,
+    r: &mut Congestion, bytes_in_flight: usize, lost_bytes: usize,
     largest_lost_pkt: &Sent, now: Instant,
 ) {
     let time_sent = largest_lost_pkt.time_sent;
     let in_congestion_recovery = r.in_congestion_recovery(time_sent);
 
+    // CUBIC_LOSS_FILTER: like picoquic, only losses outside the current
+    // recovery window feed the filter, and a new event needs it to pass.
+    // quiche reports one batch per call, so feed its n packet numbers.
+    if !in_congestion_recovery && knobs().loss_filter {
+        let mds = r.max_datagram_size;
+        let n = cmp::max(1, lost_bytes.div_ceil(mds)) as u64;
+        let largest = largest_lost_pkt.pkt_num;
+        let mut pass = false;
+        for pn in largest.saturating_sub(n - 1)..=largest {
+            pass = loss_filter_update(&mut r.cubic_state, pn);
+        }
+        if !pass {
+            eprintln!(
+                "FILTERDBG epoch={:.6} rate={:.3} skip",
+                dbg_epoch(),
+                r.cubic_state.smoothed_drop_rate
+            );
+            return;
+        }
+    }
+
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.
     if !in_congestion_recovery {
+        let cwnd_before = r.congestion_window;
+        let dbg_before = r.congestion_window / r.max_datagram_size;
+        let dbg_age_ms = now.saturating_duration_since(time_sent).as_secs_f64() *
+            1000.0;
         r.congestion_recovery_start_time = Some(now);
 
         // Fast convergence
-        if (r.congestion_window as f64) < r.cubic_state.w_max {
-            r.cubic_state.w_max =
-                r.congestion_window as f64 * (1.0 + BETA_CUBIC) / 2.0;
-        } else {
+        let ssthresh = if knobs().pico_fc {
+            // picoquic cubic_enter_recovery(): W_max = cwnd; if below the
+            // last W_max, W_max *= beta (and that lower W_max sets the cut);
+            // new cwnd = ssthresh = beta * W_max.
+            let w = r.congestion_window as f64;
+            if w < r.cubic_state.w_last_max {
+                r.cubic_state.w_last_max = w;
+                r.cubic_state.w_max = w * beta();
+            } else {
+                r.cubic_state.w_last_max = w;
+                r.cubic_state.w_max = w;
+            }
+            (r.cubic_state.w_max * beta()) as usize
+        } else if knobs().no_fc {
+            // CUBIC_NO_FC=1: RFC 9438 sec 4.7 -- with a single flow fast
+            // convergence SHOULD be disabled: always remember cwnd.
             r.cubic_state.w_max = r.congestion_window as f64;
-        }
-
-        let ssthresh = (r.congestion_window as f64 * BETA_CUBIC) as usize;
+            (r.congestion_window as f64 * beta()) as usize
+        } else {
+            if (r.congestion_window as f64) < r.cubic_state.w_max {
+                r.cubic_state.w_max =
+                    r.congestion_window as f64 * (1.0 + beta()) / 2.0;
+            } else {
+                r.cubic_state.w_max = r.congestion_window as f64;
+            }
+            (r.congestion_window as f64 * beta()) as usize
+        };
         let ssthresh =
             cmp::max(ssthresh, r.max_datagram_size * MINIMUM_WINDOW_PACKETS);
         r.ssthresh.update(ssthresh, r.hystart.in_css());
@@ -386,17 +540,40 @@ fn congestion_event(
         };
 
         r.cubic_state.cwnd_inc =
-            (r.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as usize;
+            (r.cubic_state.cwnd_inc as f64 * beta()) as usize;
 
-        r.cubic_state.w_est = r.congestion_window as f64;
-        r.cubic_state.alpha_aimd = ALPHA_AIMD;
+        // CUBIC_WEST_HALF: picoquic restarts its Reno estimate at old_cwnd/2
+        // (cubic.c cubic_enter_recovery), RFC 9438 at the new cwnd.
+        r.cubic_state.w_est = if knobs().west_half {
+            cwnd_before as f64 / 2.0
+        } else {
+            r.congestion_window as f64
+        };
+        r.cubic_state.alpha_aimd = alpha_aimd();
 
         if r.hystart.in_css() {
             r.hystart.congestion_event();
         }
 
         r.prr.congestion_event(bytes_in_flight);
+
+        eprintln!(
+            "CUTDBG epoch={:.6} cwnd_before={} cwnd_after={} wmax={:.1} inflight={} lost_age_ms={:.1}",
+            dbg_epoch(),
+            dbg_before,
+            r.congestion_window / r.max_datagram_size,
+            r.cubic_state.w_max / r.max_datagram_size as f64,
+            bytes_in_flight / r.max_datagram_size,
+            dbg_age_ms
+        );
     }
+}
+
+fn dbg_epoch() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn checkpoint(r: &mut Congestion) {
